@@ -5,9 +5,13 @@
 //! UI consumer cannot tell whether frames came from app.warp.dev or from
 //! oz-local. Semantics are deliberately minimal for Phase 0 — the first
 //! emitted frame produces a synthetic `StreamInit` + `CreateTask` pair, text
-//! and thinking deltas are forwarded as `AppendToMessageContent`, usage
-//! updates are serialised into `UpdateTaskServerData`, and `Done` is mapped
-//! to `StreamFinished` with a best-effort reason mapping.
+//! and thinking deltas are forwarded as `AppendToMessageContent` carrying the
+//! rendered payload in the `Message.message` oneof (`AgentOutput`,
+//! `AgentReasoning`, `ToolCall`). `UsageUpdate` frames are accumulated into
+//! adapter state and flushed onto `StreamFinished.token_usage` when `Done`
+//! arrives. `Message.server_message_data` and `UpdateTaskServerData.server_data`
+//! are reserved for opaque client-roundtrip payloads and are intentionally left
+//! untouched by this adapter.
 
 use crate::frame::OzResponseFrame;
 use uuid::Uuid;
@@ -40,6 +44,10 @@ pub struct UiAdapter {
     sent_init: bool,
     task_id: String,
     message_id: String,
+    /// Accumulated token usage. Populated by `UsageUpdate` frames
+    /// (last-write-wins for Phase 0) and flushed onto `StreamFinished` when
+    /// `Done` arrives.
+    pending_usage: Option<wmaa::response_event::stream_finished::TokenUsage>,
 }
 
 impl UiAdapter {
@@ -51,6 +59,7 @@ impl UiAdapter {
             sent_init: false,
             task_id: format!("task-{}", Uuid::new_v4()),
             message_id: format!("msg-{}", Uuid::new_v4()),
+            pending_usage: None,
         }
     }
 
@@ -58,7 +67,14 @@ impl UiAdapter {
     /// [`wmaa::ResponseEvent`] values.
     pub fn translate(&mut self, frame: &OzResponseFrame) -> Vec<wmaa::ResponseEvent> {
         let mut events: Vec<wmaa::ResponseEvent> = Vec::new();
-        if !self.sent_init {
+        let needs_prelude = matches!(
+            frame,
+            OzResponseFrame::TextDelta { .. }
+                | OzResponseFrame::ThinkingDelta { .. }
+                | OzResponseFrame::ToolUse { .. }
+                | OzResponseFrame::Done { .. }
+        );
+        if !self.sent_init && needs_prelude {
             events.push(self.stream_init_event());
             events.push(self.create_task_event());
             self.sent_init = true;
@@ -84,15 +100,19 @@ impl UiAdapter {
                 cache_read,
                 cache_write,
             } => {
-                events.push(self.usage_event(
-                    *input_tokens,
-                    *output_tokens,
-                    *cache_read,
-                    *cache_write,
-                ));
+                // Accumulate into adapter state; do NOT emit a ClientAction.
+                // The usage is flushed onto `StreamFinished.token_usage` when
+                // `Done` arrives. Last-write-wins across multiple frames.
+                self.pending_usage = Some(wmaa::response_event::stream_finished::TokenUsage {
+                    total_input: u32::try_from(*input_tokens).unwrap_or(u32::MAX),
+                    output: u32::try_from(*output_tokens).unwrap_or(u32::MAX),
+                    input_cache_read: u32::try_from(*cache_read).unwrap_or(u32::MAX),
+                    input_cache_write: u32::try_from(*cache_write).unwrap_or(u32::MAX),
+                    ..Default::default()
+                });
             }
             OzResponseFrame::Done { stop_reason } => {
-                events.push(Self::stream_finished_event(stop_reason));
+                events.push(self.stream_finished_event(stop_reason));
             }
         }
         events
@@ -133,7 +153,11 @@ impl UiAdapter {
         let message = wmaa::Message {
             id: self.message_id.clone(),
             task_id: self.task_id.clone(),
-            server_message_data: text.to_string(),
+            message: Some(wmaa::message::Message::AgentOutput(
+                wmaa::message::AgentOutput {
+                    text: text.to_string(),
+                },
+            )),
             ..Default::default()
         };
         let action = wmaa::ClientAction {
@@ -154,7 +178,12 @@ impl UiAdapter {
         let message = wmaa::Message {
             id: self.message_id.clone(),
             task_id: self.task_id.clone(),
-            server_message_data: text.to_string(),
+            message: Some(wmaa::message::Message::AgentReasoning(
+                wmaa::message::AgentReasoning {
+                    reasoning: text.to_string(),
+                    finished_duration: None,
+                },
+            )),
             ..Default::default()
         };
         let action = wmaa::ClientAction {
@@ -163,7 +192,7 @@ impl UiAdapter {
                     task_id: self.task_id.clone(),
                     message: Some(message),
                     mask: Some(::prost_types::FieldMask {
-                        paths: vec!["agent_output.thinking".to_string()],
+                        paths: vec!["agent_reasoning.reasoning".to_string()],
                     }),
                 },
             )),
@@ -177,19 +206,28 @@ impl UiAdapter {
         name: &str,
         input: &serde_json::Value,
     ) -> wmaa::ResponseEvent {
-        // Phase 0 scaffolding: encode tool_use as an AppendToMessageContent
-        // carrying a JSON blob of {id, name, input}. Richer mapping to the
-        // real ToolUse message variant is deferred to Phase 1.
-        let blob = serde_json::json!({
+        // Phase 0: The generated `Message.ToolCall` wraps a `tool` oneof of
+        // ~33 tool-specific variants (RunShellCommand, ReadFiles, ...). We do
+        // not attempt variant-specific decoding here — upstream BYOK tool
+        // names are arbitrary and Warp's client decoder reads the generic
+        // `Server { payload }` variant for opaque round-trippable payloads.
+        // Richer variant mapping is deferred to Phase 1.
+        let payload = serde_json::json!({
             "id": id,
             "name": name,
             "input": input,
         })
         .to_string();
+        let tool_call = wmaa::message::ToolCall {
+            tool_call_id: id.to_string(),
+            tool: Some(wmaa::message::tool_call::Tool::Server(
+                wmaa::message::tool_call::Server { payload },
+            )),
+        };
         let message = wmaa::Message {
             id: self.message_id.clone(),
             task_id: self.task_id.clone(),
-            server_message_data: blob,
+            message: Some(wmaa::message::Message::ToolCall(tool_call)),
             ..Default::default()
         };
         let action = wmaa::ClientAction {
@@ -198,7 +236,7 @@ impl UiAdapter {
                     task_id: self.task_id.clone(),
                     message: Some(message),
                     mask: Some(::prost_types::FieldMask {
-                        paths: vec!["agent_output.tool_use".to_string()],
+                        paths: vec!["tool_call.server.payload".to_string()],
                     }),
                 },
             )),
@@ -206,26 +244,7 @@ impl UiAdapter {
         Self::client_actions_event(vec![action])
     }
 
-    fn usage_event(&self, i: u64, o: u64, cr: u64, cw: u64) -> wmaa::ResponseEvent {
-        let payload = serde_json::json!({
-            "input_tokens": i,
-            "output_tokens": o,
-            "cache_read": cr,
-            "cache_write": cw,
-        })
-        .to_string();
-        let action = wmaa::ClientAction {
-            action: Some(wmaa::client_action::Action::UpdateTaskServerData(
-                wmaa::client_action::UpdateTaskServerData {
-                    task_id: self.task_id.clone(),
-                    server_data: payload,
-                },
-            )),
-        };
-        Self::client_actions_event(vec![action])
-    }
-
-    fn stream_finished_event(reason: &str) -> wmaa::ResponseEvent {
+    fn stream_finished_event(&self, reason: &str) -> wmaa::ResponseEvent {
         use wmaa::response_event::stream_finished;
         let reason_variant = match reason {
             "max_tokens" => {
@@ -240,10 +259,16 @@ impl UiAdapter {
             }
             _ => stream_finished::Reason::Other(stream_finished::Other {}),
         };
+        let token_usage = self
+            .pending_usage
+            .clone()
+            .map(|tu| vec![tu])
+            .unwrap_or_default();
         wmaa::ResponseEvent {
             r#type: Some(wmaa::response_event::Type::Finished(
                 wmaa::response_event::StreamFinished {
                     reason: Some(reason_variant),
+                    token_usage,
                     ..Default::default()
                 },
             )),
