@@ -1,0 +1,9 @@
+/target
+/Cargo.lock.bak
+*.swp
+.DS_Store
+/.vscode
+/.idea
+*.pem
+*.key
+*.crt

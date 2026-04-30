@@ -1,0 +1,60 @@
+[package]
+name = "warp-byok-proxy"
+version = "0.0.1"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Local proxy routing Warp's AI calls to AWS Bedrock (Phase 0 wedge)"
+repository = "https://github.com/praxstack/warp-byok-proxy"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+http-body-util = "0.1"
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+rcgen = "0.13"
+aws-sdk-bedrockruntime = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+aws-smithy-runtime-api = "1"
+aws-types = "1"
+prost = "0.13"
+prost-types = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+base64 = "0.22"
+bytes = "1"
+futures-core = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
+dirs = "5"
+security-framework = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dependencies.warp_multi_agent_api]
+git = "https://github.com/warpdotdev/warp-proto-apis.git"
+# NOTE: pin exact rev after fetch; see Task 4 step 2
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+wiremock = "0.6"
+aws-smithy-mocks = "0.1"
+pretty_assertions = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
