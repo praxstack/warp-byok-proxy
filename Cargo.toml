@@ -24,6 +24,7 @@ aws-sdk-bedrockruntime = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
 aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
 aws-types = "1"
 prost = "0.14"
 prost-types = "0.14"

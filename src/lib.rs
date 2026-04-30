@@ -11,6 +11,7 @@ pub mod config;
 pub mod frame;
 pub mod model_id;
 pub mod route_multi_agent;
+pub mod sdk_translator;
 pub mod server;
 pub mod stream_accumulator;
 pub mod thinking;

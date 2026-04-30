@@ -11,10 +11,14 @@
 //! stream (Task 15 E2E test).
 
 use crate::auth::ResolvedAuth;
+use crate::sdk_translator;
 use crate::stream_accumulator::BedrockEvent;
 use crate::translator::BedrockInput;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
+use aws_sdk_bedrockruntime::types::{
+    ContentBlockDelta, ContentBlockStart, ConverseStreamOutput, ReasoningContentBlockDelta,
+};
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -128,19 +132,19 @@ impl BedrockLike for MockBedrock {
 
 /// Real Bedrock implementation of [`BedrockLike`].
 ///
-/// Stubbed for Phase 0 — Task 17 lands the ignored smoke-test skeleton in
-/// `tests/smoke_real_bedrock.rs` so the wiring is exercised, but the actual
-/// SDK call stays `todo!` until a follow-up session implements:
+/// Dispatches the fluent `converse_stream()` builder on the SDK client using
+/// translations from [`sdk_translator`] (Steps 1, 2, 4 of Phase 0):
+///   * `messages: Vec<serde_json::Value>` → `Vec<types::Message>`
+///   * `system: Option<serde_json::Value>` → `Vec<types::SystemContentBlock>`
+///   * `additional_model_request_fields: serde_json::Value` →
+///     `aws_smithy_types::Document`
+///   * `tools` is currently always `None` on `BedrockInput` (Phase 1 work).
 ///
-///   * `Vec<serde_json::Value>` → `Vec<aws_sdk_bedrockruntime::types::Message>`
-///     (role / content-block typed conversion, including cache-point markers)
-///   * optional `serde_json::Value` system → `Vec<SystemContentBlock>`
-///   * optional tools `serde_json::Value` → `ToolConfiguration`
-///   * `serde_json::Value` additional fields → `aws_smithy_types::Document`
-///   * Translation of each `types::ConverseStreamOutput` variant back into our
-///     `stream_accumulator::BedrockEvent` enum (6 variants map 1:1).
-///
-/// Calling [`BedrockLike::converse_stream`] on this stub today panics.
+/// The `EventReceiver` returned by the SDK is drained in a spawned task and
+/// each `ConverseStreamOutput` variant is mapped to the matching
+/// [`BedrockEvent`] (6-way 1:1 translation). Unknown variants or per-event
+/// SDK errors surface as `Err(_)` on the `ReceiverStream` and terminate the
+/// drain loop.
 #[must_use]
 pub struct RealBedrock {
     /// Underlying Bedrock SDK client, built by [`build_client`].
@@ -151,11 +155,144 @@ pub struct RealBedrock {
 impl BedrockLike for RealBedrock {
     async fn converse_stream(
         &self,
-        _input: BedrockInput,
+        input: BedrockInput,
     ) -> Result<ReceiverStream<Result<BedrockEvent>>> {
-        // See module-level doc on `RealBedrock` for the unfinished translation
-        // contract. Task 17 ships only the ignored skeleton smoke test; the
-        // real impl lands in a follow-up so we don't guess at SDK internals.
-        todo!("real Bedrock streaming - follow-up to Task 17 skeleton")
+        // --- Step 1: serde messages → typed SDK messages ---
+        let sdk_messages = sdk_translator::messages_to_sdk(&input.messages)
+            .context("translate messages to SDK shape")?;
+        // --- Step 2: serde system → typed SDK system blocks ---
+        let sdk_system = sdk_translator::system_to_sdk(input.system.as_ref())
+            .context("translate system to SDK shape")?;
+        // --- Step 4: serde additionalModelRequestFields → smithy Document ---
+        let amrf_doc = sdk_translator::json_to_document(&input.additional_model_request_fields);
+
+        // Assemble the fluent call. Tool translation (Step 3) is deferred to
+        // Phase 1; translator::extract_tool_defs returns None today.
+        let mut fluent = self
+            .client
+            .converse_stream()
+            .model_id(input.wire_model_id.clone())
+            .set_messages(Some(sdk_messages))
+            .additional_model_request_fields(amrf_doc);
+        if !sdk_system.is_empty() {
+            fluent = fluent.set_system(Some(sdk_system));
+        }
+
+        let output = fluent
+            .send()
+            .await
+            .context("Bedrock ConverseStream dispatch failed")?;
+        let mut stream = output.stream;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            loop {
+                match stream.recv().await {
+                    Ok(Some(sdk_event)) => {
+                        let Some(bedrock_ev) = translate_output_event(sdk_event) else {
+                            continue;
+                        };
+                        if tx.send(Ok(bedrock_ev)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(anyhow::anyhow!("bedrock stream recv: {e}")))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(ReceiverStream::new(rx))
+    }
+}
+
+/// Translate a single `ConverseStreamOutput` variant to our [`BedrockEvent`]
+/// enum. Returns `None` when the SDK yields an event variant we don't yet
+/// surface (`Unknown` — forward-compat) or when a delta has no payload.
+///
+/// The SDK types are all `#[non_exhaustive]`, which forces us to keep a
+/// wildcard match arm — the explicit `Unknown` variants are not publicly
+/// constructible. We silence `wildcard_enum_match_arm` at the function level
+/// to document that this is deliberate forward-compat, not sloppiness.
+#[allow(clippy::cast_sign_loss, clippy::wildcard_enum_match_arm)]
+fn translate_output_event(sdk_event: ConverseStreamOutput) -> Option<BedrockEvent> {
+    match sdk_event {
+        ConverseStreamOutput::MessageStart(_) => Some(BedrockEvent::MessageStart),
+        ConverseStreamOutput::ContentBlockStart(ev) => {
+            let idx = u32::try_from(ev.content_block_index).unwrap_or(0);
+            // Text blocks emit no start payload; only ToolUse surfaces a
+            // typed payload that the accumulator needs to pick up id+name from.
+            // Image/ToolResult/Unknown/None all fall through to "text" so the
+            // accumulator's default block kind kicks in.
+            let kind = if let Some(ContentBlockStart::ToolUse(tu)) = ev.start {
+                serde_json::json!({
+                    "type": "tool_use",
+                    "id": tu.tool_use_id,
+                    "name": tu.name,
+                })
+                .to_string()
+            } else {
+                "text".to_string()
+            };
+            Some(BedrockEvent::ContentBlockStart {
+                block_index: idx,
+                kind,
+            })
+        }
+        ConverseStreamOutput::ContentBlockDelta(ev) => {
+            let idx = u32::try_from(ev.content_block_index).unwrap_or(0);
+            // Only Text / ToolUse / ReasoningContent(Text|Signature) map into
+            // our BedrockEvent delta shape. Everything else (Citation, Image,
+            // ToolResult, Blob reasoning, and the non_exhaustive Unknown
+            // tails) is dropped via early `return None`.
+            let delta_json = match ev.delta {
+                Some(ContentBlockDelta::Text(t)) => {
+                    serde_json::json!({ "type": "text_delta", "text": t }).to_string()
+                }
+                Some(ContentBlockDelta::ToolUse(tu)) => serde_json::json!({
+                    "type": "input_json_delta",
+                    "partial_json": tu.input,
+                })
+                .to_string(),
+                Some(ContentBlockDelta::ReasoningContent(ReasoningContentBlockDelta::Text(t))) => {
+                    serde_json::json!({ "type": "thinking_delta", "thinking": t }).to_string()
+                }
+                Some(ContentBlockDelta::ReasoningContent(
+                    ReasoningContentBlockDelta::Signature(s),
+                )) => serde_json::json!({ "type": "signature_delta", "signature": s }).to_string(),
+                _ => return None,
+            };
+            Some(BedrockEvent::ContentBlockDelta {
+                block_index: idx,
+                delta_json,
+            })
+        }
+        ConverseStreamOutput::ContentBlockStop(ev) => {
+            let idx = u32::try_from(ev.content_block_index).unwrap_or(0);
+            Some(BedrockEvent::ContentBlockStop { block_index: idx })
+        }
+        ConverseStreamOutput::MessageStop(ev) => Some(BedrockEvent::MessageStop {
+            stop_reason: ev.stop_reason.as_str().to_string(),
+        }),
+        ConverseStreamOutput::Metadata(m) => {
+            let usage = m.usage.as_ref();
+            let to_u64 = |v: i32| u64::try_from(v).unwrap_or(0);
+            Some(BedrockEvent::MessageStreamMetadata {
+                input_tokens: usage.map_or(0, |u| to_u64(u.input_tokens)),
+                output_tokens: usage.map_or(0, |u| to_u64(u.output_tokens)),
+                cache_read: usage
+                    .and_then(|u| u.cache_read_input_tokens)
+                    .map_or(0, to_u64),
+                cache_write: usage
+                    .and_then(|u| u.cache_write_input_tokens)
+                    .map_or(0, to_u64),
+            })
+        }
+        // Forward-compat: ignore unknown union variants rather than erroring.
+        _ => None,
     }
 }

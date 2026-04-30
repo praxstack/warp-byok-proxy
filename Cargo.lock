@@ -3171,6 +3171,7 @@ dependencies = [
  "aws-sdk-bedrockruntime",
  "aws-smithy-mocks",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "aws-types",
  "base64",
  "bytes",
