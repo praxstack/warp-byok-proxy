@@ -1,14 +1,24 @@
-//! HTTPS server (Task 14). Binds a TCP listener, terminates TLS via rustls, and
-//! serves a minimal hyper 1.x service. `/health` returns 200; `/ai/multi-agent`
-//! is a Task-15 placeholder returning 501. Route wiring into the Bedrock
-//! pipeline lands in Task 15; Task 14 only lands the server skeleton so the
-//! boot test can exercise the TLS handshake + request path end-to-end.
+//! HTTPS server. Binds a TCP listener, terminates TLS via rustls, and serves a
+//! minimal hyper 1.x service.
+//!
+//! Two public entry points:
+//!
+//!   * [`spawn_test_server`] — Task 14's skeleton. `/health` returns 200;
+//!     `/ai/multi-agent` responds 501. Still used by the health boot test.
+//!   * [`spawn`] — Task 15 wiring. Accepts an `Arc<Config>` + `Arc<dyn
+//!     BedrockLike>` and delegates `POST /ai/multi-agent` to
+//!     [`crate::route_multi_agent::handle`]. Everything else shares the Task
+//!     14 semantics (200 on `/health`, 404 otherwise).
 
+use crate::bedrock_client::BedrockLike;
+use crate::config::Config;
+use crate::route_multi_agent::{self, BoxedBody};
 use anyhow::{Context, Result};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -93,6 +103,127 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor) {
                 tracing::warn!(?e, "connection error");
             }
         });
+    }
+}
+
+/// Spawn an HTTPS server wired to the Task 15 `/ai/multi-agent` pipeline.
+///
+/// Identical TLS + accept-loop plumbing as [`spawn_test_server`], but the
+/// per-request handler dispatches `POST /ai/multi-agent` to
+/// [`route_multi_agent::handle`] with the supplied `cfg` + `bedrock`
+/// implementation. All other paths preserve the Task 14 behavior.
+///
+/// # Errors
+/// Same as [`spawn_test_server`].
+pub async fn spawn(
+    bind: &str,
+    cert_pem: &Path,
+    key_pem: &Path,
+    cfg: Arc<Config>,
+    bedrock: Arc<dyn BedrockLike>,
+) -> Result<(SocketAddr, ShutdownTx)> {
+    let tls_cfg = tls_config_from_pem(cert_pem, key_pem)?;
+    let listener = TcpListener::bind(bind).await.context("bind")?;
+    let addr = listener.local_addr()?;
+    let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
+    let (tx, rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = rx => { tracing::info!("server shutdown signal received"); }
+            () = accept_loop_with_ctx(listener, acceptor, cfg, bedrock) => {}
+        }
+    });
+    Ok((addr, ShutdownTx(tx)))
+}
+
+async fn accept_loop_with_ctx(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    cfg: Arc<Config>,
+    bedrock: Arc<dyn BedrockLike>,
+) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(?e, "accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let cfg = cfg.clone();
+        let bedrock = bedrock.clone();
+        tokio::spawn(async move {
+            let tls = match acceptor.accept(stream).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(%peer, ?e, "tls handshake failed");
+                    return;
+                }
+            };
+            let io = TokioIo::new(tls);
+            let svc = hyper::service::service_fn(move |req| {
+                let cfg = cfg.clone();
+                let bedrock = bedrock.clone();
+                async move { handle_with_context(req, cfg, bedrock).await }
+            });
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await
+            {
+                tracing::warn!(?e, "connection error");
+            }
+        });
+    }
+}
+
+/// Wraps a `Full<Bytes>` body as the `BoxedBody` the multi-agent route uses,
+/// mapping the `Infallible` error into `io::Error` so the types line up.
+fn full_to_boxed(body: Full<Bytes>) -> BoxedBody {
+    body.map_err(|never: Infallible| match never {}).boxed()
+}
+
+/// Dispatcher for the Task-15 server: routes `POST /ai/multi-agent` into the
+/// pipeline; everything else preserves the Task-14 health/404 semantics.
+///
+/// Never returns `Err` up to hyper — any internal failure is surfaced as a 500
+/// with the anyhow chain in the body. Returning `Err` would close the
+/// connection without a response, which is worse UX for callers.
+async fn handle_with_context(
+    req: Request<Incoming>,
+    cfg: Arc<Config>,
+    bedrock: Arc<dyn BedrockLike>,
+) -> Result<Response<BoxedBody>, Infallible> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    match (method, path.as_str()) {
+        (hyper::Method::POST, "/ai/multi-agent") => {
+            match route_multi_agent::handle(req, cfg, bedrock).await {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    tracing::error!(?e, "route_multi_agent error");
+                    let body = Full::new(Bytes::from(format!("{e:#}")));
+                    let resp = Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(full_to_boxed(body))
+                        .expect("static 500 response");
+                    Ok(resp)
+                }
+            }
+        }
+        (hyper::Method::GET, "/health") => {
+            let body = Full::new(Bytes::from("ok"));
+            Ok(Response::new(full_to_boxed(body)))
+        }
+        _ => {
+            let body = Full::new(Bytes::new());
+            let resp = Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(full_to_boxed(body))
+                .expect("static 404 response");
+            Ok(resp)
+        }
     }
 }
 
