@@ -7,8 +7,8 @@
 //!   * `output_config`: `{ "effort": "low|medium|high|max" }` (paired with adaptive)
 //!
 //! Prior to this shape, the plan used a single `reasoningConfig` blob — Bedrock
-//! rejects that with "Extra inputs are not permitted; use thinking.type.adaptive
-//! and output_config.effort". The plan's pseudocode predated the GA shape.
+//! rejects that with "Extra inputs are not permitted; use `thinking.type.adaptive`
+//! and `output_config.effort`". The plan's pseudocode predated the GA shape.
 
 use crate::config::{Effort, ThinkingMode};
 use anyhow::Result;
