@@ -3,6 +3,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod auth;
+pub mod betas;
 pub mod cert;
 pub mod config;
 pub mod model_id;
