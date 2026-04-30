@@ -55,11 +55,27 @@ pub async fn handle(
         .await
         .context("read body")?
         .to_bytes();
+    let req_id = uuid::Uuid::new_v4();
+    tracing::info!(%req_id, bytes = body_bytes.len(), "POST /ai/multi-agent received");
     let warp_req = warp_multi_agent_api::Request::decode(body_bytes.as_ref())
         .context("decode protobuf Request")?;
+    // Dump the top-level shape — what kind of Input are we seeing?
+    tracing::debug!(
+        %req_id,
+        input_kind = ?warp_req.input.as_ref().and_then(|i| i.r#type.as_ref()).map(std::mem::discriminant),
+        "decoded Request"
+    );
 
     // Step 2 — translate to Bedrock input.
     let bedrock_input = translate_warp_request(&warp_req, &cfg)?;
+    tracing::info!(
+        %req_id,
+        model = %bedrock_input.wire_model_id,
+        n_messages = bedrock_input.messages.len(),
+        has_system = bedrock_input.system.is_some(),
+        amrf = %bedrock_input.additional_model_request_fields,
+        "translated to Bedrock input"
+    );
 
     // Step 3 — start the Bedrock stream.
     let mut bedrock_stream = bedrock.converse_stream(bedrock_input).await?;
@@ -71,6 +87,9 @@ pub async fn handle(
     tokio::spawn(async move {
         let mut acc = StreamAccumulator::new();
         let mut adapter = UiAdapter::new(UiAdapterOpts::default());
+        let mut event_count = 0u32;
+        let mut frame_count = 0u32;
+        let mut sse_count = 0u32;
         while let Some(ev_res) = bedrock_stream.next().await {
             let ev = match ev_res {
                 Ok(e) => e,
@@ -80,20 +99,35 @@ pub async fn handle(
                     // structured "stream aborted" frame instead of a silent EOF.
                     // Currently the client sees the headers + whatever frames made
                     // it through, then EOF — indistinguishable from clean end-of-turn.
-                    tracing::warn!(?e, "bedrock stream err; client will see silent EOF");
+                    tracing::warn!(%req_id, ?e, "bedrock stream err; client will see silent EOF");
                     break;
                 }
             };
+            event_count += 1;
+            tracing::debug!(%req_id, event_count, ?ev, "bedrock event");
             let frames = acc.handle(ev);
             for f in frames {
+                frame_count += 1;
+                tracing::debug!(%req_id, frame_count, frame = ?f, "frame emitted");
                 for re in adapter.translate(&f) {
+                    sse_count += 1;
+                    tracing::debug!(
+                        %req_id, sse_count,
+                        re_type = ?re.r#type.as_ref().map(std::mem::discriminant),
+                        "SSE frame built"
+                    );
                     let bytes = encode_sse_event(&re);
                     if tx.send(Ok(Frame::data(bytes))).await.is_err() {
+                        tracing::warn!(%req_id, "client dropped connection mid-stream");
                         return;
                     }
                 }
             }
         }
+        tracing::info!(
+            %req_id, event_count, frame_count, sse_count,
+            "turn complete"
+        );
     });
 
     // Step 7 — wrap the receiver as an SSE body.
