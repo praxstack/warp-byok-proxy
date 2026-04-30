@@ -19,9 +19,31 @@ fn generate_self_signed_produces_valid_pem() {
 fn generate_self_signed_includes_both_sans() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = cert::generate_self_signed(tmp.path(), &["127.0.0.1", "app.warp.dev"]).unwrap();
-    let cert_der = std::fs::read(&paths.cert_pem).unwrap();
+    let cert_pem_bytes = std::fs::read(&paths.cert_pem).unwrap();
     // Dump the PEM and assert it parses; SAN content check is best-effort via text.
-    let pem_str = String::from_utf8(cert_der).unwrap();
+    let pem_str = String::from_utf8(cert_pem_bytes).unwrap();
     assert!(pem_str.contains("-----BEGIN CERTIFICATE-----"));
     // Deeper SAN assertion is done via `openssl x509 -text` in Task 15.
+}
+
+#[cfg(unix)]
+#[test]
+fn key_pem_permissions_are_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = cert::generate_self_signed(tmp.path(), &["127.0.0.1"]).unwrap();
+    let key_meta = std::fs::metadata(&paths.key_pem).unwrap();
+    let mode = key_meta.permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "key.pem mode = 0o{mode:o}, want 0o600");
+}
+
+#[cfg(unix)]
+#[test]
+fn cert_pem_permissions_are_0644() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = cert::generate_self_signed(tmp.path(), &["127.0.0.1"]).unwrap();
+    let cert_meta = std::fs::metadata(&paths.cert_pem).unwrap();
+    let mode = cert_meta.permissions().mode() & 0o777;
+    assert_eq!(mode, 0o644, "cert.pem mode = 0o{mode:o}, want 0o644");
 }

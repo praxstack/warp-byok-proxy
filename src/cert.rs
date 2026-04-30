@@ -1,10 +1,32 @@
 use anyhow::{Context, Result};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 pub struct CertPaths {
     pub cert_pem: PathBuf,
     pub key_pem: PathBuf,
+}
+
+fn write_with_mode(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(mode);
+        let mut f = opts
+            .open(path)
+            .with_context(|| format!("open {}", path.display()))?;
+        f.write_all(contents)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Generate a self-signed leaf cert + keypair and write `cert.pem` / `key.pem` into `out_dir`.
@@ -22,6 +44,10 @@ pub fn generate_self_signed(out_dir: &Path, sans: &[&str]) -> Result<CertPaths> 
     dn.push(DnType::OrganizationName, "praxstack");
     params.distinguished_name = dn;
 
+    // Phase 0: SANs come from a hardcoded list in main.rs. If Phase B exposes
+    // SANs via user config, add DNS-label validation (e.g. regex) to reject
+    // malformed inputs like "1.2.3" that fail IpAddr parsing and then fall
+    // through to DnsName::try_from as a nonsensical label.
     for san in sans {
         if let Ok(ip) = san.parse::<std::net::IpAddr>() {
             params.subject_alt_names.push(SanType::IpAddress(ip));
@@ -37,8 +63,8 @@ pub fn generate_self_signed(out_dir: &Path, sans: &[&str]) -> Result<CertPaths> 
 
     let cert_pem_path = out_dir.join("cert.pem");
     let key_pem_path = out_dir.join("key.pem");
-    std::fs::write(&cert_pem_path, cert.pem().as_bytes()).context("write cert.pem")?;
-    std::fs::write(&key_pem_path, key.serialize_pem().as_bytes()).context("write key.pem")?;
+    write_with_mode(&cert_pem_path, cert.pem().as_bytes(), 0o644)?;
+    write_with_mode(&key_pem_path, key.serialize_pem().as_bytes(), 0o600)?;
 
     Ok(CertPaths {
         cert_pem: cert_pem_path,
@@ -47,7 +73,7 @@ pub fn generate_self_signed(out_dir: &Path, sans: &[&str]) -> Result<CertPaths> 
 }
 
 /// macOS-only. Adds the cert to the system keychain so Warp's `hyper` client trusts it.
-/// Requires sudo. Returns `false` and a hint if `security` is not available.
+/// Requires sudo.
 ///
 /// # Errors
 ///
