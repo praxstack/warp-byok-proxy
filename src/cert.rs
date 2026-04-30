@@ -13,8 +13,18 @@ pub struct CertPaths {
 fn write_with_mode(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
+        // SAFETY: mode() only applies when open(2) creates a new inode. If a
+        // file already exists at `path`, the kernel reuses its existing inode
+        // and mode — truncate resets content but not permissions. Removing
+        // first ensures we create fresh and the declared mode takes effect.
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("remove {} before write", path.display())));
+            }
+        }
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true).mode(mode);
+        opts.write(true).create_new(true).mode(mode);
         let mut f = opts
             .open(path)
             .with_context(|| format!("open {}", path.display()))?;
