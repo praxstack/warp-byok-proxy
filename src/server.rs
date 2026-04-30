@@ -18,7 +18,12 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
-#[must_use]
+/// Shutdown handle for a server spawned by [`spawn_test_server`].
+///
+/// Dropping this handle does NOT shut down the server — the internal
+/// `oneshot::Sender` is dropped silently and the accept loop continues
+/// running. Call [`ShutdownTx::send`] to actually stop the server.
+#[must_use = "dropping ShutdownTx does not stop the server; call .send(()) to shut down"]
 pub struct ShutdownTx(pub oneshot::Sender<()>);
 impl ShutdownTx {
     /// Send the shutdown signal. The `()` arg matches the plan's pseudo-signature
@@ -91,6 +96,9 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor) {
     }
 }
 
+// TODO(task-15): switch return type to `Response<BoxedBody>` so the
+// /ai/multi-agent arm can stream SSE frames from the Bedrock pipeline.
+// /health + 404 arms will wrap Full<Bytes> in BoxBody::new(...).
 async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
     match (req.method().clone(), req.uri().path()) {
         (hyper::Method::GET, "/health") => Ok(Response::new(Full::new(Bytes::from("ok")))),
