@@ -46,13 +46,20 @@ sudo warp-byok-proxy cert --install
 # 2. Add the /etc/hosts redirect (one-time).
 sudo sh -c 'echo "127.0.0.1 app.warp.dev" >> /etc/hosts'
 
-# 3. Configure AWS creds in ~/.config/warp-byok-proxy/config.toml (see below).
+# 3. Configure AWS creds. On macOS the config lives at:
+#    ~/Library/Application Support/warp-byok-proxy/config.toml
+#    (See "Config file" section below.)
 
 # 4. Run the proxy (requires sudo because port 443).
 sudo -E warp-byok-proxy run
 ```
 
-## Config file (`~/.config/warp-byok-proxy/config.toml`)
+## Config file
+
+- **macOS:** `~/Library/Application Support/warp-byok-proxy/config.toml`
+- **Linux:** `~/.config/warp-byok-proxy/config.toml`
+
+(The proxy uses the `dirs` crate's `config_dir()` which follows platform conventions.)
 
 ```toml
 [bedrock]
