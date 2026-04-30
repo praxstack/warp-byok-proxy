@@ -104,15 +104,21 @@ fn thinking_block_with_signature() {
 }
 
 #[test]
-fn delta_for_unknown_block_index_returns_empty() {
+fn delta_for_unknown_block_auto_starts_text_block() {
+    // Bedrock sometimes omits ContentBlockStart for the first plain-text block
+    // of a turn (matching Anthropic's streaming shape). The accumulator must
+    // lazily auto-create a text block state rather than drop the delta —
+    // otherwise Warp gets empty response bubbles. Caught live on 2026-04-30
+    // when the real proxy received ~40 deltas without any prior start event.
     let mut acc = StreamAccumulator::new();
     let f = acc.handle(BedrockEvent::ContentBlockDelta {
         block_index: 999,
         delta_json: r#"{"type":"text_delta","text":"ignored"}"#.into(),
     });
+    assert_eq!(f.len(), 1, "expected one TextDelta emission, got {f:?}");
     assert!(
-        f.is_empty(),
-        "delta for unknown block should emit nothing, got {f:?}"
+        matches!(&f[0], OzResponseFrame::TextDelta { block_index: 999, text } if text == "ignored"),
+        "expected TextDelta auto-emission for unknown block, got {f:?}"
     );
 }
 

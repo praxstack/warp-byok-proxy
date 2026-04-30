@@ -80,10 +80,17 @@ impl StreamAccumulator {
                 block_index,
                 delta_json,
             } => {
-                let Some(state) = self.blocks.get_mut(&block_index) else {
-                    tracing::warn!(%block_index, "delta for unknown block");
-                    return Vec::new();
-                };
+                // Bedrock sometimes omits `ContentBlockStart` for the first
+                // plain-text block of a turn (matching Anthropic's streaming
+                // behavior). Auto-create a text block state when a delta
+                // arrives for an unknown block_index rather than dropping it.
+                let state = self.blocks.entry(block_index).or_insert_with(|| {
+                    tracing::debug!(%block_index, "auto-starting text block on first delta (no prior ContentBlockStart)");
+                    BlockState {
+                        kind: BlockKind::Text,
+                        tool_use: None,
+                    }
+                });
                 handle_delta(state, block_index, &delta_json)
             }
             BedrockEvent::ContentBlockStop { block_index } => {
