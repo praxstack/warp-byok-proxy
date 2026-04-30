@@ -238,7 +238,9 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::
         (hyper::Method::GET, "/health") => Ok(Response::new(Full::new(Bytes::from("ok")))),
         (hyper::Method::POST, "/ai/multi-agent") => Ok(Response::builder()
             .status(StatusCode::NOT_IMPLEMENTED)
-            .body(Full::new(Bytes::from("Phase 0 WIP (use `spawn`, not `spawn_test_server`)")))
+            .body(Full::new(Bytes::from(
+                "Phase 0 WIP (use `spawn`, not `spawn_test_server`)",
+            )))
             .unwrap()),
         _ => Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
