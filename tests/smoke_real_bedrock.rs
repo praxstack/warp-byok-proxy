@@ -43,7 +43,13 @@ async fn opus_4_7_1m_max_thinking_streams_tokens() {
         [bedrock]
         auth_mode = "api-key"
         region = "us-east-1"
-        model = "anthropic.claude-opus-4-7-v1:0:1m"
+        # NOTE: real Bedrock model ID for Opus 4.7 is `anthropic.claude-opus-4-7`
+        # (no `-v1:0` suffix). Our `:1m` marker is stripped by model_id.rs and
+        # the CRI prefix turns this into `us.anthropic.claude-opus-4-7` on the
+        # wire — which is a valid system-defined inference profile.
+        # The 1M context is NOT in the model id itself; it rides as
+        # `anthropic_beta: ["context-1m-2025-08-07"]` in additional_model_request_fields.
+        model = "anthropic.claude-opus-4-7:1m"
         [bedrock.thinking]
         mode = "adaptive"
         effort = "max"
@@ -62,7 +68,7 @@ async fn opus_4_7_1m_max_thinking_streams_tokens() {
         matches!(resolved, auth::ResolvedAuth::BearerToken(_)),
         "api-key auth must resolve to ResolvedAuth::BearerToken"
     );
-    assert_eq!(cfg.bedrock.model, "anthropic.claude-opus-4-7-v1:0:1m");
+    assert_eq!(cfg.bedrock.model, "anthropic.claude-opus-4-7:1m");
 
     // Bedrock's AWS SDK (1.x) picks up AWS_BEARER_TOKEN_BEDROCK from the
     // process environment and injects it as an Authorization: Bearer header

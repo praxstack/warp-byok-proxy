@@ -19,14 +19,22 @@ fn translates_empty_request_to_bedrock_input_with_model_and_betas() {
     let req = warp_multi_agent_api::Request::default();
     let out = translate_warp_request(&req, &cfg).unwrap();
     assert_eq!(out.wire_model_id, "us.anthropic.claude-opus-4-7-v1:0");
-    assert!(out
-        .additional_model_request_fields
-        .to_string()
-        .contains("context-1m-2025-08-07"));
-    assert!(out
-        .additional_model_request_fields
-        .to_string()
-        .contains("reasoningConfig"));
+    let amrf = out.additional_model_request_fields.to_string();
+    assert!(
+        amrf.contains("context-1m-2025-08-07"),
+        "1M beta missing: {amrf}"
+    );
+    // Bedrock-GA shape: `thinking` + `output_config` top-level keys
+    // (not the old plan-only `reasoningConfig` blob).
+    assert!(
+        amrf.contains("\"thinking\""),
+        "thinking key missing: {amrf}"
+    );
+    assert!(
+        amrf.contains("\"output_config\""),
+        "output_config key missing: {amrf}"
+    );
+    assert!(amrf.contains("adaptive"), "adaptive mode missing: {amrf}");
 }
 
 #[test]

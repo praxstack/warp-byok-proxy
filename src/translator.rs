@@ -74,8 +74,11 @@ pub fn translate_warp_request(
     if !betas.is_empty() {
         amrf.insert("anthropic_beta".into(), json!(betas));
     }
-    if let Some(r) = reasoning {
-        amrf.insert("reasoningConfig".into(), r);
+    if let Some(t) = reasoning.thinking {
+        amrf.insert("thinking".into(), t);
+    }
+    if let Some(o) = reasoning.output_config {
+        amrf.insert("output_config".into(), o);
     }
 
     Ok(BedrockInput {
