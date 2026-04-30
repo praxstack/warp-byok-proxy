@@ -10,6 +10,7 @@ pub mod cert;
 pub mod config;
 pub mod frame;
 pub mod model_id;
+pub mod server;
 pub mod stream_accumulator;
 pub mod thinking;
 pub mod translator;
