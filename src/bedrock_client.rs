@@ -128,8 +128,19 @@ impl BedrockLike for MockBedrock {
 
 /// Real Bedrock implementation of [`BedrockLike`].
 ///
-/// Stubbed for Phase 0 — Task 17 will populate the actual `converse_stream`
-/// call using [`build_client`]. Calling it today panics.
+/// Stubbed for Phase 0 — Task 17 lands the ignored smoke-test skeleton in
+/// `tests/smoke_real_bedrock.rs` so the wiring is exercised, but the actual
+/// SDK call stays `todo!` until a follow-up session implements:
+///
+///   * `Vec<serde_json::Value>` → `Vec<aws_sdk_bedrockruntime::types::Message>`
+///     (role / content-block typed conversion, including cache-point markers)
+///   * optional `serde_json::Value` system → `Vec<SystemContentBlock>`
+///   * optional tools `serde_json::Value` → `ToolConfiguration`
+///   * `serde_json::Value` additional fields → `aws_smithy_types::Document`
+///   * Translation of each `types::ConverseStreamOutput` variant back into our
+///     `stream_accumulator::BedrockEvent` enum (6 variants map 1:1).
+///
+/// Calling [`BedrockLike::converse_stream`] on this stub today panics.
 #[must_use]
 pub struct RealBedrock {
     /// Underlying Bedrock SDK client, built by [`build_client`].
@@ -142,6 +153,9 @@ impl BedrockLike for RealBedrock {
         &self,
         _input: BedrockInput,
     ) -> Result<ReceiverStream<Result<BedrockEvent>>> {
-        todo!("real Bedrock streaming - Task 17")
+        // See module-level doc on `RealBedrock` for the unfinished translation
+        // contract. Task 17 ships only the ignored skeleton smoke test; the
+        // real impl lands in a follow-up so we don't guess at SDK internals.
+        todo!("real Bedrock streaming - follow-up to Task 17 skeleton")
     }
 }
