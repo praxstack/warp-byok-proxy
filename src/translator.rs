@@ -5,9 +5,12 @@
 //! injection ([`crate::cache`]) into a single [`BedrockInput`] suitable for
 //! feeding the Bedrock runtime client.
 //!
-//! Phase 0 note: prompt extraction from `req.task_context` is stubbed. The
-//! real walker lands after the Day-5 audit; for now this produces a single
-//! placeholder user message so the E2E round-trip is wired end-to-end.
+//! Phase 0 note: prompt extraction is minimal — it walks
+//! `req.input → UserInputs → UserQuery` and emits one user message per query.
+//! The full `task_context` / tool-result walker (resume, `code_review`,
+//! `invoke_skill`, summarize, `messages_from_agents`, etc.) lands in Phase 1.
+//! When no `UserQuery` is present the walker falls back to a diagnostic stub
+//! message so the gap is visible in Task 17's smoke test.
 
 use crate::{betas, cache, config::Config, model_id, thinking};
 use anyhow::Result;
@@ -53,9 +56,10 @@ pub fn translate_warp_request(
         budget_tokens: cfg.bedrock.thinking.budget_tokens,
     })?;
 
-    // Phase 0 stub: produce a minimal messages list. Real task_context → messages
-    // translation is Day-5 work informed by the audit. For now, extract ONLY
-    // UserInputs.text_content (the bare minimum to prove a prompt flows through).
+    // Phase 0 minimal-real walker: pulls UserQuery.query text out of
+    // Request.input → UserInputs. See `extract_user_messages` below. The full
+    // task_context walker (resume, code_review, invoke_skill, summarize,
+    // tool results, messages_from_agents, ...) lands in Phase 1.
     let messages = extract_user_messages(req);
     let system = extract_system_prompt(req);
 
@@ -83,14 +87,54 @@ pub fn translate_warp_request(
     })
 }
 
-fn extract_user_messages(_req: &warp_multi_agent_api::Request) -> Vec<Value> {
-    // TODO: walk req.input / req.task_context. Phase 0 stub returns a single
-    // user message from whatever text we can find, so the E2E round-trip works.
-    // Replace after the audit.
-    vec![json!({
-        "role": "user",
-        "content": [{"type": "text", "text": "[PHASE0 STUB: prompt extraction incomplete]"}]
-    })]
+fn extract_user_messages(req: &warp_multi_agent_api::Request) -> Vec<Value> {
+    // Phase 0 minimal-real walker:
+    //   req.input                  : Option<request::Input> (message wrapper)
+    //   request::Input.r#type      : Option<request::input::Type> (oneof)
+    //   request::input::Type::UserInputs(UserInputs)
+    //   UserInputs.inputs          : Vec<user_inputs::UserInput>
+    //   user_inputs::UserInput.input : Option<user_input::Input> (oneof)
+    //   user_input::Input::UserQuery(UserQuery)
+    //   UserQuery.query            : String
+    //
+    // Everything else (ToolCallResult, ResumeConversation, CodeReview,
+    // InvokeSkill, SummarizeConversation, ...) is deferred to Phase 1's
+    // full task_context walker. We emit one user message per UserQuery
+    // found so Task 17's smoke test exercises a real prompt end-to-end.
+    use warp_multi_agent_api::request::input::user_inputs::user_input as ui_oneof;
+    use warp_multi_agent_api::request::input::Type as InputType;
+
+    let mut messages = Vec::new();
+
+    if let Some(input) = req.input.as_ref() {
+        if let Some(InputType::UserInputs(user_inputs)) = input.r#type.as_ref() {
+            for ui in &user_inputs.inputs {
+                if let Some(ui_oneof::Input::UserQuery(uq)) = ui.input.as_ref() {
+                    if !uq.query.trim().is_empty() {
+                        messages.push(json!({
+                            "role": "user",
+                            "content": [{"type": "text", "text": uq.query.clone()}]
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: if the walker found no queries (unsupported input variant or
+    // empty UserInputs), emit a diagnostic stub so Task 17 surfaces the gap
+    // clearly rather than silently sending nothing.
+    if messages.is_empty() {
+        tracing::warn!(
+            "translator: no UserQuery found in request.input; Phase 0 falls back to a diagnostic stub"
+        );
+        messages.push(json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "[PHASE0 WALKER: no UserQuery found in request.input]"}]
+        }));
+    }
+
+    messages
 }
 
 fn extract_system_prompt(_req: &warp_multi_agent_api::Request) -> Option<Value> {

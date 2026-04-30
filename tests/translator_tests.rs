@@ -28,3 +28,50 @@ fn translates_empty_request_to_bedrock_input_with_model_and_betas() {
         .to_string()
         .contains("reasoningConfig"));
 }
+
+#[test]
+fn translates_user_query_text_into_bedrock_messages() {
+    // Build a minimal Request carrying a UserQuery with real prompt text.
+    // Verified proto layout (from target/debug/build/.../warp.multi_agent.v1.rs):
+    //   Request.input : Option<request::Input>              (message, not oneof)
+    //   request::Input.r#type : Option<request::input::Type> (the oneof)
+    //   request::input::Type::UserInputs(request::input::UserInputs)
+    //   request::input::UserInputs.inputs : Vec<request::input::user_inputs::UserInput>
+    //   request::input::user_inputs::UserInput.input :
+    //       Option<request::input::user_inputs::user_input::Input>
+    //   request::input::user_inputs::user_input::Input::UserQuery(request::input::UserQuery)
+    //   request::input::UserQuery.query : String
+    use warp_multi_agent_api::request::input::user_inputs::user_input as ui_oneof;
+    use warp_multi_agent_api::request::input::user_inputs::UserInput;
+    use warp_multi_agent_api::request::input::{self as req_input, UserInputs, UserQuery};
+    use warp_multi_agent_api::request::Input as RequestInput;
+    use warp_multi_agent_api::Request;
+
+    let req = Request {
+        input: Some(RequestInput {
+            r#type: Some(req_input::Type::UserInputs(UserInputs {
+                inputs: vec![UserInput {
+                    input: Some(ui_oneof::Input::UserQuery(UserQuery {
+                        query: "hello from prax".into(),
+                        ..Default::default()
+                    })),
+                }],
+            })),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let cfg = minimal_config();
+    let out = translate_warp_request(&req, &cfg).unwrap();
+
+    let serialized = serde_json::to_string(&out.messages).unwrap();
+    assert!(
+        serialized.contains("hello from prax"),
+        "expected user query in translated messages, got: {serialized}"
+    );
+    assert!(
+        !serialized.contains("PHASE0 STUB"),
+        "placeholder leaked into translated output: {serialized}"
+    );
+}
