@@ -227,19 +227,19 @@ async fn handle_with_context(
     }
 }
 
-// TODO(task-15): switch return type to `Response<BoxedBody>` so the
-// /ai/multi-agent arm can stream SSE frames from the Bedrock pipeline.
-// /health + 404 arms will wrap Full<Bytes> in BoxBody::new(...).
+// Task 14 legacy handler — retained solely for `spawn_test_server` and its
+// health-boot integration test. Task 15 went with a parallel
+// `handle_with_context` + `spawn` rather than refactoring this one, so
+// `spawn_test_server` continues to exercise this code path verbatim.
+// The `POST /ai/multi-agent` arm here still returns 501; the real pipeline
+// lives in `handle_with_context` above.
 async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
     match (req.method().clone(), req.uri().path()) {
         (hyper::Method::GET, "/health") => Ok(Response::new(Full::new(Bytes::from("ok")))),
-        (hyper::Method::POST, "/ai/multi-agent") => {
-            // Placeholder; real routing lives in Task 15.
-            Ok(Response::builder()
-                .status(StatusCode::NOT_IMPLEMENTED)
-                .body(Full::new(Bytes::from("Phase 0 WIP")))
-                .unwrap())
-        }
+        (hyper::Method::POST, "/ai/multi-agent") => Ok(Response::builder()
+            .status(StatusCode::NOT_IMPLEMENTED)
+            .body(Full::new(Bytes::from("Phase 0 WIP (use `spawn`, not `spawn_test_server`)")))
+            .unwrap()),
         _ => Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Full::new(Bytes::new()))

@@ -75,7 +75,12 @@ pub async fn handle(
             let ev = match ev_res {
                 Ok(e) => e,
                 Err(e) => {
-                    tracing::warn!(?e, "bedrock stream err");
+                    // TODO(phase-1): emit a synthesized StreamFinished ResponseEvent
+                    // with an error reason BEFORE breaking, so the Warp UI sees a
+                    // structured "stream aborted" frame instead of a silent EOF.
+                    // Currently the client sees the headers + whatever frames made
+                    // it through, then EOF — indistinguishable from clean end-of-turn.
+                    tracing::warn!(?e, "bedrock stream err; client will see silent EOF");
                     break;
                 }
             };
