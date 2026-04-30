@@ -3,3 +3,4 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod cert;
+pub mod config;
