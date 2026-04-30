@@ -1,10 +1,11 @@
-use anyhow::Context;
+use anyhow::{Context, Result};
 use clap::Parser;
+use std::sync::Arc;
 
 mod cli;
 mod logging;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     logging::init();
     let cli = cli::Cli::parse();
     match cli.command {
@@ -13,7 +14,7 @@ fn main() -> anyhow::Result<()> {
             if std::env::var("WARP_BYOK_PROXY_SELFTEST_EXIT").is_ok() {
                 return Ok(());
             }
-            println!("run on {bind} — not implemented yet");
+            run_server(bind)?;
         }
         cli::Command::Cert { install } => {
             let out = dirs::config_dir()
@@ -34,5 +35,80 @@ fn main() -> anyhow::Result<()> {
             println!("login mode={mode} — not implemented yet");
         }
     }
+    Ok(())
+}
+
+/// Load config, build the real-Bedrock provider, and serve until Ctrl-C.
+fn run_server(bind: &str) -> Result<()> {
+    use warp_byok_proxy::{
+        auth::{self, AuthInputs},
+        bedrock_client::{self, BedrockLike, RealBedrock},
+        config::Config,
+        server,
+    };
+
+    // 1. Load config.
+    let cfg_path = dirs::config_dir()
+        .context("no config_dir")?
+        .join("warp-byok-proxy/config.toml");
+    tracing::info!(cfg = %cfg_path.display(), "loading config");
+    let cfg_text = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("read config at {}", cfg_path.display()))?;
+    let cfg: Config = toml::from_str(&cfg_text).context("parse config.toml")?;
+    cfg.validate().context("config.validate()")?;
+    for w in cfg.validate_with_warnings().unwrap_or_default() {
+        tracing::warn!(%w, "config warning");
+    }
+
+    // 2. Resolve auth. For api-key mode the SDK reads AWS_BEARER_TOKEN_BEDROCK
+    //    from the env directly, but we still validate that it's present.
+    let api_key = std::env::var("AWS_BEARER_TOKEN_BEDROCK").ok();
+    let inputs = AuthInputs {
+        mode: cfg.bedrock.auth_mode.clone().into(),
+        api_key,
+        profile: cfg.bedrock.profile.clone(),
+        region: Some(cfg.bedrock.region.clone()),
+        ..Default::default()
+    };
+    let resolved = auth::resolve_auth(&inputs).context("resolve auth")?;
+    tracing::info!(auth_kind = ?std::mem::discriminant(&resolved), "auth resolved");
+
+    // 3. Locate the cert/key minted by `cert --install`.
+    let cert_dir = dirs::config_dir()
+        .context("no config_dir")?
+        .join("warp-byok-proxy");
+    let cert_pem = cert_dir.join("cert.pem");
+    let key_pem = cert_dir.join("key.pem");
+    anyhow::ensure!(
+        cert_pem.exists() && key_pem.exists(),
+        "cert not found at {}. Run `warp-byok-proxy cert --install` first.",
+        cert_pem.display()
+    );
+
+    // 4. Build the AWS SDK client + wrap it in RealBedrock.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+    let bedrock: Arc<dyn BedrockLike> = rt.block_on(async {
+        let client = bedrock_client::build_client(
+            &resolved,
+            &cfg.bedrock.region,
+            cfg.bedrock.endpoint.as_deref(),
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(Arc::new(RealBedrock { client }) as Arc<dyn BedrockLike>)
+    })?;
+
+    // 5. Spawn the server and wait for Ctrl-C.
+    rt.block_on(async {
+        let (addr, shutdown) =
+            server::spawn(bind, &cert_pem, &key_pem, Arc::new(cfg), bedrock).await?;
+        tracing::info!(%addr, "server ready — Ctrl-C to quit");
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("shutdown signal received");
+        let _ = shutdown.send(());
+        Ok::<_, anyhow::Error>(())
+    })?;
     Ok(())
 }
