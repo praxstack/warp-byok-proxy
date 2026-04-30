@@ -44,7 +44,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dependencies.warp_multi_agent_api]
 git = "https://github.com/warpdotdev/warp-proto-apis.git"
-# NOTE: pin exact rev after fetch; see Task 4 step 2
+rev = "aa2f9cde164a5b48ac01087d417d1188771f9b6d"
 
 [dev-dependencies]
 assert_cmd = "2"
