@@ -225,6 +225,9 @@ fn handle_delta(
                 partial_json: piece.to_string(),
             }]
         }
-        _ => Vec::new(),
+        _ => {
+            tracing::debug!(kind = ?state.kind, delta_type = %ty, %block_index, "unhandled delta tuple");
+            Vec::new()
+        }
     }
 }

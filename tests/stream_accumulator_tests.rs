@@ -102,3 +102,77 @@ fn thinking_block_with_signature() {
         matches!(f2[0], OzResponseFrame::ThinkingDelta { signature: Some(ref s), .. } if s == "sig_abc")
     );
 }
+
+#[test]
+fn delta_for_unknown_block_index_returns_empty() {
+    let mut acc = StreamAccumulator::new();
+    let f = acc.handle(BedrockEvent::ContentBlockDelta {
+        block_index: 999,
+        delta_json: r#"{"type":"text_delta","text":"ignored"}"#.into(),
+    });
+    assert!(
+        f.is_empty(),
+        "delta for unknown block should emit nothing, got {f:?}"
+    );
+}
+
+#[test]
+fn interleaved_blocks_each_track_independent_state() {
+    let mut acc = StreamAccumulator::new();
+    // Start two concurrent blocks: a text block (0) and a tool_use block (1).
+    acc.handle(BedrockEvent::ContentBlockStart {
+        block_index: 0,
+        kind: "text".into(),
+    });
+    acc.handle(BedrockEvent::ContentBlockStart {
+        block_index: 1,
+        kind: r#"{"type":"tool_use","id":"tu_x","name":"ls"}"#.into(),
+    });
+
+    // Interleave deltas: text -> tool -> text -> tool.
+    let t1 = acc.handle(BedrockEvent::ContentBlockDelta {
+        block_index: 0,
+        delta_json: r#"{"type":"text_delta","text":"A"}"#.into(),
+    });
+    assert!(
+        matches!(t1[0], OzResponseFrame::TextDelta { block_index: 0, ref text } if text == "A")
+    );
+
+    let u1 = acc.handle(BedrockEvent::ContentBlockDelta {
+        block_index: 1,
+        delta_json: r#"{"type":"input_json_delta","partial_json":"{\"a\":1"}"#.into(),
+    });
+    assert!(matches!(
+        u1[0],
+        OzResponseFrame::ToolUseInputDelta { block_index: 1, .. }
+    ));
+
+    let t2 = acc.handle(BedrockEvent::ContentBlockDelta {
+        block_index: 0,
+        delta_json: r#"{"type":"text_delta","text":"B"}"#.into(),
+    });
+    assert!(
+        matches!(t2[0], OzResponseFrame::TextDelta { block_index: 0, ref text } if text == "B")
+    );
+
+    // Close text block — BlockStop only (no ToolUse frame since it was a Text block).
+    let t_stop = acc.handle(BedrockEvent::ContentBlockStop { block_index: 0 });
+    assert_eq!(t_stop, vec![OzResponseFrame::BlockStop { block_index: 0 }]);
+
+    // Finish tool_use partial_json and close it — should produce ToolUse frame
+    // with merged JSON "{\"a\":1}", then BlockStop{1}.
+    acc.handle(BedrockEvent::ContentBlockDelta {
+        block_index: 1,
+        delta_json: r#"{"type":"input_json_delta","partial_json":"}"}"#.into(),
+    });
+    let u_stop = acc.handle(BedrockEvent::ContentBlockStop { block_index: 1 });
+    assert!(
+        u_stop.iter().any(
+            |f| matches!(f, OzResponseFrame::ToolUse { block_index: 1, id, .. } if id == "tu_x")
+        ),
+        "expected ToolUse for block 1 with id tu_x, got {u_stop:?}"
+    );
+    assert!(u_stop
+        .iter()
+        .any(|f| matches!(f, OzResponseFrame::BlockStop { block_index: 1 })));
+}
