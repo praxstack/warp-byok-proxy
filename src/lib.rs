@@ -11,3 +11,4 @@ pub mod frame;
 pub mod model_id;
 pub mod stream_accumulator;
 pub mod thinking;
+pub mod ui_adapter;
