@@ -2,5 +2,6 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod auth;
 pub mod cert;
 pub mod config;
