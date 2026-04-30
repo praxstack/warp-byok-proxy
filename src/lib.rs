@@ -7,5 +7,7 @@ pub mod betas;
 pub mod cache;
 pub mod cert;
 pub mod config;
+pub mod frame;
 pub mod model_id;
+pub mod stream_accumulator;
 pub mod thinking;
