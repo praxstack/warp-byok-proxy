@@ -65,6 +65,25 @@ impl UiAdapter {
 
     /// Translates a single [`OzResponseFrame`] into zero or more
     /// [`wmaa::ResponseEvent`] values.
+    ///
+    /// Warp's UI rendering path (verified 2026-04-30 via audit of the open-
+    /// source client code at `app/src/ai/agent/{conversation,task}.rs`)
+    /// requires a specific prelude sequence before the first
+    /// `AppendToMessageContent` can land:
+    ///
+    /// 1. `StreamInit` (non-empty `request_id`, `conversation_id`).
+    /// 2. `CreateTask { task: Task{ id, messages: vec![] } }` — registers the
+    ///    task so later `task_id` references resolve.
+    /// 3. `AddMessagesToTask { task_id, messages: vec![Message{ id, task_id,
+    ///    message: AgentOutput{ text: "" } }] }` — creates an empty message
+    ///    with a stable `message.id` that later `AppendToMessageContent`
+    ///    events target. `append_to_message_content` in `task.rs:754-763`
+    ///    returns `MessageNotFound` if no prior message with matching `id`
+    ///    exists.
+    ///
+    /// After the prelude, each text chunk rides an `AppendToMessageContent`
+    /// with `mask: FieldMask{ paths: ["message.agent_output.text"] }` (rooted
+    /// at the Message descriptor; NOT `"agent_output.text"`).
     pub fn translate(&mut self, frame: &OzResponseFrame) -> Vec<wmaa::ResponseEvent> {
         let mut events: Vec<wmaa::ResponseEvent> = Vec::new();
         let needs_prelude = matches!(
@@ -75,8 +94,12 @@ impl UiAdapter {
                 | OzResponseFrame::Done { .. }
         );
         if !self.sent_init && needs_prelude {
+            // 3-part prelude — each must land BEFORE the first append. See
+            // doc on `translate` above and the real-world audit of Warp's
+            // consumer code for why all three are required.
             events.push(self.stream_init_event());
             events.push(self.create_task_event());
+            events.push(self.add_messages_to_task_event());
             self.sent_init = true;
         }
         match frame {
@@ -140,13 +163,35 @@ impl UiAdapter {
                 wmaa::client_action::CreateTask { task: Some(task) },
             )),
         };
-        wmaa::ResponseEvent {
-            r#type: Some(wmaa::response_event::Type::ClientActions(
-                wmaa::response_event::ClientActions {
-                    actions: vec![action],
+        Self::client_actions_event(vec![action])
+    }
+
+    /// Emits `AddMessagesToTask` carrying an empty `AgentOutput` message with
+    /// `id == self.message_id`. This is required BEFORE the first
+    /// `AppendToMessageContent` so that Warp's `append_to_message_content`
+    /// handler (in `task.rs:754-763`) can find a matching message by id.
+    /// Skipping this step is what causes Warp to silently drop appends and
+    /// render nothing — the bug caught live on 2026-04-30.
+    fn add_messages_to_task_event(&self) -> wmaa::ResponseEvent {
+        let message = wmaa::Message {
+            id: self.message_id.clone(),
+            task_id: self.task_id.clone(),
+            message: Some(wmaa::message::Message::AgentOutput(
+                wmaa::message::AgentOutput {
+                    text: String::new(),
                 },
             )),
-        }
+            ..Default::default()
+        };
+        let action = wmaa::ClientAction {
+            action: Some(wmaa::client_action::Action::AddMessagesToTask(
+                wmaa::client_action::AddMessagesToTask {
+                    task_id: self.task_id.clone(),
+                    messages: vec![message],
+                },
+            )),
+        };
+        Self::client_actions_event(vec![action])
     }
 
     fn append_text_event(&self, text: &str) -> wmaa::ResponseEvent {
@@ -165,8 +210,12 @@ impl UiAdapter {
                 wmaa::client_action::AppendToMessageContent {
                     task_id: self.task_id.clone(),
                     message: Some(message),
+                    // Path rooted at the Message proto descriptor: the
+                    // top-level segment is `message` (the oneof), NOT the
+                    // variant name directly. Warp's `append_to_message_content`
+                    // walks this via `api::MESSAGE_DESCRIPTOR`.
                     mask: Some(::prost_types::FieldMask {
-                        paths: vec!["agent_output.text".to_string()],
+                        paths: vec!["message.agent_output.text".to_string()],
                     }),
                 },
             )),
@@ -191,8 +240,10 @@ impl UiAdapter {
                 wmaa::client_action::AppendToMessageContent {
                     task_id: self.task_id.clone(),
                     message: Some(message),
+                    // Same descriptor-rooted convention as text (see
+                    // append_text_event for rationale).
                     mask: Some(::prost_types::FieldMask {
-                        paths: vec!["agent_reasoning.reasoning".to_string()],
+                        paths: vec!["message.agent_reasoning.reasoning".to_string()],
                     }),
                 },
             )),
@@ -235,8 +286,9 @@ impl UiAdapter {
                 wmaa::client_action::AppendToMessageContent {
                     task_id: self.task_id.clone(),
                     message: Some(message),
+                    // Descriptor-rooted; same convention as text/thinking.
                     mask: Some(::prost_types::FieldMask {
-                        paths: vec!["tool_call.server.payload".to_string()],
+                        paths: vec!["message.tool_call.server.payload".to_string()],
                     }),
                 },
             )),
