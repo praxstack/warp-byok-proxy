@@ -83,10 +83,32 @@ pub async fn handle(
     // Channel carrying hyper body frames back to the client.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(32);
 
+    // Extract session identifiers from the incoming Request so StreamInit
+    // carries non-empty conversation_id / request_id / run_id. Warp's UI
+    // rejects responses where these are blank (caught live 2026-04-30 when
+    // our adapter emitted StreamInit with all three as empty strings and
+    // Warp rendered "I couldn't complete that request"). If the incoming
+    // Request has no conversation_id, we synthesize a fresh UUID so the
+    // UI has something non-empty to bind to.
+    let conversation_id = warp_req
+        .metadata
+        .as_ref()
+        .map(|m| m.conversation_id.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("conv-{}", uuid::Uuid::new_v4()));
+    let request_id = format!("req-{req_id}");
+    let run_id = format!("run-{}", uuid::Uuid::new_v4());
+    tracing::info!(%req_id, %conversation_id, %request_id, %run_id, "session ids bound");
+    let opts = UiAdapterOpts {
+        conversation_id: Some(conversation_id),
+        request_id: Some(request_id),
+        run_id: Some(run_id),
+    };
+
     // Steps 4–6 — pump events through accumulator + adapter, emit SSE frames.
     tokio::spawn(async move {
         let mut acc = StreamAccumulator::new();
-        let mut adapter = UiAdapter::new(UiAdapterOpts::default());
+        let mut adapter = UiAdapter::new(opts);
         let mut event_count = 0u32;
         let mut frame_count = 0u32;
         let mut sse_count = 0u32;
