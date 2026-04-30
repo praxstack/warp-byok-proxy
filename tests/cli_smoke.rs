@@ -20,3 +20,13 @@ fn warp_byok_proxy_version_prints_0_0_1() {
         .success()
         .stdout(predicate::str::contains("0.0.1"));
 }
+
+#[test]
+fn run_subcommand_emits_startup_log() {
+    let mut cmd = Command::cargo_bin("warp-byok-proxy").unwrap();
+    cmd.env("RUST_LOG", "info")
+        .env("WARP_BYOK_PROXY_SELFTEST_EXIT", "1")
+        .arg("run");
+    cmd.assert()
+        .stderr(predicate::str::contains("warp-byok-proxy starting"));
+}
