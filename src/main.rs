@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::Parser;
 
 mod cli;
@@ -15,8 +16,18 @@ fn main() -> anyhow::Result<()> {
             println!("run on {bind} — not implemented yet");
         }
         cli::Command::Cert { install } => {
-            tracing::info!(%install, "warp-byok-proxy cert");
-            println!("cert install={install} — not implemented yet");
+            let out = dirs::config_dir()
+                .context("no config_dir")?
+                .join("warp-byok-proxy");
+            let paths =
+                warp_byok_proxy::cert::generate_self_signed(&out, &["127.0.0.1", "app.warp.dev"])?;
+            tracing::info!(cert = %paths.cert_pem.display(), "generated self-signed cert");
+            println!("cert: {}", paths.cert_pem.display());
+            println!("key:  {}", paths.key_pem.display());
+            if install {
+                warp_byok_proxy::cert::install_to_keychain(&paths.cert_pem)?;
+                tracing::info!("cert installed to System.keychain");
+            }
         }
         cli::Command::Login { ref mode } => {
             tracing::info!(%mode, "warp-byok-proxy login");
