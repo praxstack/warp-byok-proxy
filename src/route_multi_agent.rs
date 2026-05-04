@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::{
     bedrock_client::BedrockLike,
     config::Config,
-    stream_accumulator::StreamAccumulator,
+    stream_accumulator::{BedrockEvent, StreamAccumulator},
     translator::translate_warp_request,
     ui_adapter::{UiAdapter, UiAdapterOpts},
 };
@@ -78,7 +78,7 @@ pub async fn handle(
     );
 
     // Step 3 — start the Bedrock stream.
-    let mut bedrock_stream = bedrock.converse_stream(bedrock_input).await?;
+    let bedrock_stream = bedrock.converse_stream(bedrock_input).await?;
 
     // Channel carrying hyper body frames back to the client.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(32);
@@ -106,51 +106,7 @@ pub async fn handle(
     };
 
     // Steps 4–6 — pump events through accumulator + adapter, emit SSE frames.
-    tokio::spawn(async move {
-        let mut acc = StreamAccumulator::new();
-        let mut adapter = UiAdapter::new(opts);
-        let mut event_count = 0u32;
-        let mut frame_count = 0u32;
-        let mut sse_count = 0u32;
-        while let Some(ev_res) = bedrock_stream.next().await {
-            let ev = match ev_res {
-                Ok(e) => e,
-                Err(e) => {
-                    // TODO(phase-1): emit a synthesized StreamFinished ResponseEvent
-                    // with an error reason BEFORE breaking, so the Warp UI sees a
-                    // structured "stream aborted" frame instead of a silent EOF.
-                    // Currently the client sees the headers + whatever frames made
-                    // it through, then EOF — indistinguishable from clean end-of-turn.
-                    tracing::warn!(%req_id, ?e, "bedrock stream err; client will see silent EOF");
-                    break;
-                }
-            };
-            event_count += 1;
-            tracing::debug!(%req_id, event_count, ?ev, "bedrock event");
-            let frames = acc.handle(ev);
-            for f in frames {
-                frame_count += 1;
-                tracing::debug!(%req_id, frame_count, frame = ?f, "frame emitted");
-                for re in adapter.translate(&f) {
-                    sse_count += 1;
-                    tracing::debug!(
-                        %req_id, sse_count,
-                        re_type = ?re.r#type.as_ref().map(std::mem::discriminant),
-                        "SSE frame built"
-                    );
-                    let bytes = encode_sse_event(&re);
-                    if tx.send(Ok(Frame::data(bytes))).await.is_err() {
-                        tracing::warn!(%req_id, "client dropped connection mid-stream");
-                        return;
-                    }
-                }
-            }
-        }
-        tracing::info!(
-            %req_id, event_count, frame_count, sse_count,
-            "turn complete"
-        );
-    });
+    tokio::spawn(pump_stream(bedrock_stream, tx, opts, req_id));
 
     // Step 7 — wrap the receiver as an SSE body.
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -171,4 +127,84 @@ fn encode_sse_event(evt: &warp_multi_agent_api::ResponseEvent) -> Bytes {
     evt.encode(&mut buf).expect("encode protobuf");
     let b64 = base64::engine::general_purpose::URL_SAFE.encode(&buf);
     Bytes::from(format!("data: {b64}\n\n"))
+}
+
+/// Drain the Bedrock event stream, push frames through the accumulator +
+/// UI adapter, and enqueue SSE-encoded bytes onto `tx`.
+///
+/// On mid-stream error, synthesizes a `BedrockEvent::MessageStop { stop_reason:
+/// "error" }` so the adapter emits a terminal `StreamFinished { reason: Other }`
+/// `ResponseEvent`. This prevents the "silent EOF looks like clean end-of-turn"
+/// failure mode caught during the 2026-04-30 live-Warp audit.
+async fn pump_stream(
+    mut bedrock_stream: tokio_stream::wrappers::ReceiverStream<Result<BedrockEvent>>,
+    tx: tokio::sync::mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+    opts: UiAdapterOpts,
+    req_id: uuid::Uuid,
+) {
+    let mut acc = StreamAccumulator::new();
+    let mut adapter = UiAdapter::new(opts);
+    let mut event_count = 0u32;
+    let mut frame_count = 0u32;
+    let mut sse_count = 0u32;
+
+    while let Some(ev_res) = bedrock_stream.next().await {
+        let ev = match ev_res {
+            Ok(e) => e,
+            Err(e) => {
+                // Synthesize a Done frame with a non-`end_turn` reason so the
+                // adapter emits StreamFinished{Reason::Other}. See module doc.
+                tracing::warn!(
+                    %req_id, ?e,
+                    "bedrock stream err; flushing synthesized StreamFinished(Other)"
+                );
+                let synth = acc.handle(BedrockEvent::MessageStop {
+                    stop_reason: "error".to_string(),
+                });
+                if flush_frames(&synth, &mut adapter, &tx, &mut frame_count, &mut sse_count)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                break;
+            }
+        };
+        event_count += 1;
+        tracing::debug!(%req_id, event_count, ?ev, "bedrock event");
+        let frames = acc.handle(ev);
+        if flush_frames(&frames, &mut adapter, &tx, &mut frame_count, &mut sse_count)
+            .await
+            .is_err()
+        {
+            tracing::warn!(%req_id, "client dropped connection mid-stream");
+            return;
+        }
+    }
+    tracing::info!(
+        %req_id, event_count, frame_count, sse_count,
+        "turn complete"
+    );
+}
+
+/// Translate a batch of frames through the adapter and push them to the SSE
+/// channel. Returns `Err(())` if the channel is closed (client dropped).
+async fn flush_frames(
+    frames: &[crate::frame::OzResponseFrame],
+    adapter: &mut UiAdapter,
+    tx: &tokio::sync::mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+    frame_count: &mut u32,
+    sse_count: &mut u32,
+) -> Result<(), ()> {
+    for f in frames {
+        *frame_count += 1;
+        for re in adapter.translate(f) {
+            *sse_count += 1;
+            let bytes = encode_sse_event(&re);
+            if tx.send(Ok(Frame::data(bytes))).await.is_err() {
+                return Err(());
+            }
+        }
+    }
+    Ok(())
 }
