@@ -157,6 +157,136 @@ fn translates_auto_code_diff_query() {
 }
 
 #[test]
+fn translates_user_inputs_tool_call_result_as_tool_result_block() {
+    // When the user turn carries a ToolCallResult (the response to a prior
+    // assistant tool_use), the walker must surface it as a Claude-shaped
+    // `tool_result` block on a user message, not drop it. The proto's inner
+    // `result` oneof has 32+ variants, so instead of per-variant marshaling
+    // we JSON-serialize the ToolCallResult via prost-reflect and hand that
+    // structured blob to Claude.
+    use warp_multi_agent_api::request::input::tool_call_result::Result as TcrResult;
+    use warp_multi_agent_api::request::input::user_inputs::user_input as ui_oneof;
+    use warp_multi_agent_api::request::input::user_inputs::UserInput;
+    use warp_multi_agent_api::request::input::{self as req_input, ToolCallResult, UserInputs};
+    use warp_multi_agent_api::request::Input as RequestInput;
+    use warp_multi_agent_api::{Request, RunShellCommandResult};
+
+    #[allow(deprecated)]
+    let shell = RunShellCommandResult {
+        command: "echo hi".into(),
+        output: "Hello, world!\n".into(),
+        exit_code: 0,
+        result: None,
+    };
+    let tcr = ToolCallResult {
+        tool_call_id: "call_shell_1".into(),
+        result: Some(TcrResult::RunShellCommand(shell)),
+    };
+    let req = Request {
+        input: Some(RequestInput {
+            r#type: Some(req_input::Type::UserInputs(UserInputs {
+                inputs: vec![UserInput {
+                    input: Some(ui_oneof::Input::ToolCallResult(tcr)),
+                }],
+            })),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let cfg = minimal_config();
+    let out = translate_warp_request(&req, &cfg).unwrap();
+    let serialized = serde_json::to_string(&out.messages).unwrap();
+
+    // Contract 1: a tool_result block with the matching tool_call_id is present.
+    assert!(
+        serialized.contains("\"type\":\"tool_result\"")
+            || serialized.contains("\"tool_result\""),
+        "expected tool_result block in messages; got {serialized}"
+    );
+    assert!(
+        serialized.contains("call_shell_1"),
+        "tool_call_id must be preserved; got {serialized}"
+    );
+    // Contract 2: the fallback diagnostic stub must NOT leak.
+    assert!(
+        !serialized.contains("PHASE0 WALKER"),
+        "ToolCallResult path fell through to stub: {serialized}"
+    );
+}
+
+#[test]
+fn translates_prior_task_messages_into_assistant_history() {
+    // Continuation turns carry prior conversation in `task_context.tasks[].messages[]`.
+    // The walker must surface prior assistant `agent_output` messages so Claude
+    // sees them as history, otherwise every turn looks like a fresh start and
+    // the model loses context for follow-up questions.
+    use warp_multi_agent_api as wmaa;
+    use warp_multi_agent_api::request::input::user_inputs::user_input as ui_oneof;
+    use warp_multi_agent_api::request::input::user_inputs::UserInput;
+    use warp_multi_agent_api::request::input::{self as req_input, UserInputs, UserQuery};
+    use warp_multi_agent_api::request::Input as RequestInput;
+    use warp_multi_agent_api::request::TaskContext;
+    use warp_multi_agent_api::Request;
+
+    // Build one prior assistant message carrying agent_output text.
+    let prior_msg = wmaa::Message {
+        id: "m1".into(),
+        task_id: "t1".into(),
+        message: Some(wmaa::message::Message::AgentOutput(
+            wmaa::message::AgentOutput {
+                text: "I ran ls and found two files.".into(),
+            },
+        )),
+        ..Default::default()
+    };
+    let task = wmaa::Task {
+        id: "t1".into(),
+        messages: vec![prior_msg],
+        ..Default::default()
+    };
+
+    let req = Request {
+        task_context: Some(TaskContext {
+            tasks: vec![task],
+        }),
+        input: Some(RequestInput {
+            r#type: Some(req_input::Type::UserInputs(UserInputs {
+                inputs: vec![UserInput {
+                    input: Some(ui_oneof::Input::UserQuery(UserQuery {
+                        query: "great, what's in the second file?".into(),
+                        ..Default::default()
+                    })),
+                }],
+            })),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let cfg = minimal_config();
+    let out = translate_warp_request(&req, &cfg).unwrap();
+    let serialized = serde_json::to_string(&out.messages).unwrap();
+
+    // Contract: both the prior assistant turn AND the new user question
+    // survive into the translated messages array, in order.
+    let ap = serialized
+        .find("I ran ls and found two files.")
+        .expect("prior assistant text must be walked into history");
+    let up = serialized
+        .find("great, what's in the second file?")
+        .expect("current user query must be walked");
+    assert!(
+        ap < up,
+        "assistant history must come before new user query; got indices {ap} vs {up} in {serialized}"
+    );
+    // The assistant turn must be tagged `role: assistant`.
+    let before_up = &serialized[..up];
+    assert!(
+        before_up.contains("\"role\":\"assistant\""),
+        "prior agent_output must be emitted with role=assistant; got {before_up}"
+    );
+}
+
+#[test]
 fn translates_query_with_canned_response_query_field() {
     // `QueryWithCannedResponse` carries a `query` string alongside the canned
     // variant tag. Even when we do not honor the canned response branch,

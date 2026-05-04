@@ -56,11 +56,10 @@ pub fn translate_warp_request(
         budget_tokens: cfg.bedrock.thinking.budget_tokens,
     })?;
 
-    // Phase 0 minimal-real walker: pulls UserQuery.query text out of
-    // Request.input → UserInputs. See `extract_user_messages` below. The full
-    // task_context walker (resume, code_review, invoke_skill, summarize,
-    // tool results, messages_from_agents, ...) lands in Phase 1.
-    let messages = extract_user_messages(req);
+    // Post-Phase-0 walker: pulls prior task history from task_context +
+    // current-turn user/tool-result blocks from Request.input. See
+    // `build_messages` below.
+    let messages = build_messages(req);
     let system = extract_system_prompt(req);
 
     // Apply cache points.
@@ -88,6 +87,140 @@ pub fn translate_warp_request(
         additional_model_request_fields: Value::Object(amrf),
         tools: extract_tool_defs(req),
     })
+}
+
+/// Compose the full Bedrock `messages` array: prior history from
+/// `task_context.tasks[*].messages[*]` (walked via [`walk_prior_messages`])
+/// followed by the current turn's input (walked via [`extract_user_messages`]).
+fn build_messages(req: &warp_multi_agent_api::Request) -> Vec<Value> {
+    let mut out = walk_prior_messages(req);
+    out.extend(extract_user_messages(req));
+    if out.is_empty() {
+        tracing::warn!(
+            "translator: no prior history AND no text-bearing input variant matched; \
+             falling back to diagnostic stub"
+        );
+        out.push(json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "[PHASE0 WALKER: no UserQuery found in request.input]"}]
+        }));
+    }
+    out
+}
+
+/// Walk every prior `task_context.tasks[*].messages[*]` into a Bedrock-shaped
+/// Claude message, preserving order. Each `Message.oneof message` variant we
+/// know the role of (`user_query`, `agent_output`, `agent_reasoning`,
+/// `tool_call`, `tool_call_result`) is surfaced; empty or unknown variants
+/// are skipped.
+///
+/// Tool-use / tool-result blocks on prior turns are encoded as Claude
+/// `tool_use` / `tool_result` blocks so a stateful tool loop can resume mid-
+/// trajectory on a continuation turn.
+fn walk_prior_messages(req: &warp_multi_agent_api::Request) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Some(tc) = req.task_context.as_ref() else {
+        return out;
+    };
+    for task in &tc.tasks {
+        for msg in &task.messages {
+            if let Some(v) = prior_message_to_json(msg) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// Translate one prior `api::Message` into a Bedrock-shaped Claude message.
+/// Returns `None` for variants that don't belong in the conversation history
+/// (UI-only metadata: `ServerEvent`, `SystemQuery`, `UpdateTodos`, ...) or
+/// for empty text payloads.
+///
+/// Implemented as an `if let` chain rather than a `match` over the 18-variant
+/// oneof because the crate is `#![deny(clippy::wildcard_enum_match_arm)]` and
+/// listing every UI-only arm individually would be pure noise.
+#[allow(deprecated)]
+fn prior_message_to_json(msg: &warp_multi_agent_api::Message) -> Option<Value> {
+    use warp_multi_agent_api::message::Message as MsgOneof;
+    let inner = msg.message.as_ref()?;
+    if let MsgOneof::UserQuery(uq) = inner {
+        if !uq.query.trim().is_empty() {
+            return Some(json!({
+                "role": "user",
+                "content": [{"type": "text", "text": uq.query.clone()}]
+            }));
+        }
+    } else if let MsgOneof::AgentOutput(a) = inner {
+        if !a.text.trim().is_empty() {
+            return Some(json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": a.text.clone()}]
+            }));
+        }
+    } else if let MsgOneof::AgentReasoning(r) = inner {
+        // Reasoning rides alongside assistant output; flatten into an
+        // assistant text block so Claude sees it in the history.
+        if !r.reasoning.trim().is_empty() {
+            return Some(json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": r.reasoning.clone()}]
+            }));
+        }
+    } else if let MsgOneof::ToolCall(tc_msg) = inner {
+        // Prior assistant tool_use — surface as a Claude tool_use block so
+        // continuation turns carry the correct trajectory.
+        let payload = dyn_msg_to_json(tc_msg);
+        let name = payload
+            .as_object()
+            .and_then(|o| o.get("tool"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|o| o.keys().next().cloned())
+            .unwrap_or_else(|| "unknown".to_string());
+        return Some(json!({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": tc_msg.tool_call_id.clone(),
+                "name": name,
+                "input": payload,
+            }]
+        }));
+    } else if let MsgOneof::ToolCallResult(tcr) = inner {
+        // Prior user tool_result — JSON-serializing the full proto gives
+        // Claude the structured payload for all 32+ result variants without
+        // per-variant marshaling.
+        let body = dyn_msg_to_json(tcr);
+        return Some(json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tcr.tool_call_id.clone(),
+                "content": [{"type": "json", "json": body}],
+            }]
+        }));
+    }
+    // Everything else (ServerEvent, SystemQuery, UpdateTodos, InvokeSkill,
+    // Summarization, CodeReview, WebSearch, ...) is UI-only metadata that
+    // does NOT belong in the Bedrock conversation history.
+    None
+}
+
+/// Serialize any `prost::Message` with a prost-reflect descriptor into a
+/// `serde_json::Value`. Uses proto3 canonical JSON encoding (camelCase field
+/// names, well-known types serialized as their JSON form).
+///
+/// Falls back to `Value::Null` on the very-rare case the transcode fails,
+/// rather than erroring — a missing tool-call payload should not block the
+/// rest of the turn from going through.
+fn dyn_msg_to_json<M: prost_reflect::ReflectMessage>(m: &M) -> Value {
+    use prost_reflect::DynamicMessage;
+    let desc = m.descriptor();
+    let mut dyn_msg = DynamicMessage::new(desc);
+    if dyn_msg.transcode_from(m).is_err() {
+        return Value::Null;
+    }
+    serde_json::to_value(&dyn_msg).unwrap_or(Value::Null)
 }
 
 // The deprecated top-level `Input::UserQuery` variant (proto field #2) is
@@ -144,9 +277,24 @@ fn extract_user_messages(req: &warp_multi_agent_api::Request) -> Vec<Value> {
                                 push_user_text(&mut messages, &uq.query);
                             }
                         }
-                        // ToolCallResult / MessagesReceivedFromAgents / etc.
-                        // are Phase-A work — they need structured marshaling
-                        // rather than plain text injection.
+                        Some(ui_oneof::Input::ToolCallResult(tcr)) => {
+                            // Current-turn tool_result: surface as a Claude
+                            // `tool_result` block. The inner proto payload is
+                            // JSON-serialized so all 32+ result variants
+                            // round-trip without per-variant marshaling.
+                            let body = dyn_msg_to_json(tcr);
+                            messages.push(json!({
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": tcr.tool_call_id.clone(),
+                                    "content": [{"type": "json", "json": body}],
+                                }]
+                            }));
+                        }
+                        // MessagesReceivedFromAgents / EventsFromAgents /
+                        // PassiveSuggestionResult stay Phase-A scope — they
+                        // carry metadata, not a user turn.
                         _ => {}
                     }
                 }
@@ -169,19 +317,8 @@ fn extract_user_messages(req: &warp_multi_agent_api::Request) -> Vec<Value> {
         }
     }
 
-    // Fallback: if the walker found no queries (unsupported input variant or
-    // empty UserInputs), emit a diagnostic stub so the turn surfaces the gap
-    // clearly rather than silently sending nothing.
-    if messages.is_empty() {
-        tracing::warn!(
-            "translator: no text-bearing input variant matched; falling back to diagnostic stub"
-        );
-        messages.push(json!({
-            "role": "user",
-            "content": [{"type": "text", "text": "[PHASE0 WALKER: no UserQuery found in request.input]"}]
-        }));
-    }
-
+    // No fallback here — `build_messages` handles the empty-prior-and-empty-
+    // input case with a single diagnostic stub so we don't double-stub.
     messages
 }
 
