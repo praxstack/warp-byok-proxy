@@ -3185,6 +3185,7 @@ dependencies = [
  "predicates",
  "pretty_assertions",
  "prost",
+ "prost-reflect",
  "prost-types",
  "rcgen",
  "reqwest",

@@ -210,12 +210,17 @@ impl UiAdapter {
                 wmaa::client_action::AppendToMessageContent {
                     task_id: self.task_id.clone(),
                     message: Some(message),
-                    // Path rooted at the Message proto descriptor: the
-                    // top-level segment is `message` (the oneof), NOT the
-                    // variant name directly. Warp's `append_to_message_content`
-                    // walks this via `api::MESSAGE_DESCRIPTOR`.
+                    // FieldMask paths are rooted at the outer `Message` proto
+                    // descriptor. Each segment must match a real field name
+                    // returned by `descriptor.get_field_by_name(...)`. In proto3,
+                    // `oneof message { AgentOutput agent_output = 3; ... }`
+                    // exposes each variant AS A TOP-LEVEL FIELD — the oneof
+                    // wrapper name `message` itself is NOT a field, so putting
+                    // it in the path causes `field_mask/src/lib.rs:108` to
+                    // silently no-op (verified via src/bin/test_fieldmask.rs).
+                    // The correct path is rooted at the variant name.
                     mask: Some(::prost_types::FieldMask {
-                        paths: vec!["message.agent_output.text".to_string()],
+                        paths: vec!["agent_output.text".to_string()],
                     }),
                 },
             )),
@@ -240,10 +245,10 @@ impl UiAdapter {
                 wmaa::client_action::AppendToMessageContent {
                     task_id: self.task_id.clone(),
                     message: Some(message),
-                    // Same descriptor-rooted convention as text (see
-                    // append_text_event for rationale).
+                    // See append_text_event for why we drop the `message.`
+                    // prefix — the oneof wrapper is not a real field.
                     mask: Some(::prost_types::FieldMask {
-                        paths: vec!["message.agent_reasoning.reasoning".to_string()],
+                        paths: vec!["agent_reasoning.reasoning".to_string()],
                     }),
                 },
             )),
@@ -286,9 +291,10 @@ impl UiAdapter {
                 wmaa::client_action::AppendToMessageContent {
                     task_id: self.task_id.clone(),
                     message: Some(message),
-                    // Descriptor-rooted; same convention as text/thinking.
+                    // Descriptor-rooted; no `message.` prefix (see
+                    // append_text_event comment).
                     mask: Some(::prost_types::FieldMask {
-                        paths: vec!["message.tool_call.server.payload".to_string()],
+                        paths: vec!["tool_call.server.payload".to_string()],
                     }),
                 },
             )),

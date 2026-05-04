@@ -267,3 +267,154 @@ fn usage_update_last_write_wins_across_multiple_emissions() {
     assert_eq!(tu.input_cache_read, 0);
     assert_eq!(tu.input_cache_write, 0);
 }
+
+// ---------------------------------------------------------------------------
+// FieldMask path assertions — rooted at `Message` descriptor, NO `message.`
+// prefix. The oneof wrapper `message` is not a field in the descriptor, so
+// a `message.X` path silently no-ops in `field_mask` apply_path, leaving the
+// target unchanged and the UI blank. (Verified via src/bin/test_fieldmask.rs.)
+// ---------------------------------------------------------------------------
+
+fn extract_mask_paths(ev: &wmaa::ResponseEvent) -> Vec<String> {
+    let Some(wmaa::response_event::Type::ClientActions(ca)) = &ev.r#type else {
+        return Vec::new();
+    };
+    ca.actions
+        .iter()
+        .flat_map(|a| match &a.action {
+            Some(wmaa::client_action::Action::AppendToMessageContent(append)) => append
+                .mask
+                .as_ref()
+                .map(|m| m.paths.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+#[test]
+fn text_delta_append_mask_has_no_message_prefix() {
+    let mut a = UiAdapter::new(UiAdapterOpts::default());
+    let events = a.translate(&OzResponseFrame::TextDelta {
+        block_index: 0,
+        text: "hi".into(),
+    });
+    let paths: Vec<String> = events.iter().flat_map(extract_mask_paths).collect();
+    assert_eq!(
+        paths,
+        vec!["agent_output.text".to_string()],
+        "FieldMask path must be rooted at `agent_output`, NOT `message.agent_output` \
+         — the oneof wrapper is not a field (verified via test_fieldmask bin). \
+         got: {paths:?}"
+    );
+}
+
+#[test]
+fn thinking_delta_append_mask_has_no_message_prefix() {
+    let mut a = UiAdapter::new(UiAdapterOpts::default());
+    let events = a.translate(&OzResponseFrame::ThinkingDelta {
+        block_index: 0,
+        text: "reasoning".into(),
+        signature: None,
+    });
+    let paths: Vec<String> = events.iter().flat_map(extract_mask_paths).collect();
+    assert_eq!(paths, vec!["agent_reasoning.reasoning".to_string()]);
+}
+
+#[test]
+fn tool_use_append_mask_has_no_message_prefix() {
+    let mut a = UiAdapter::new(UiAdapterOpts::default());
+    let events = a.translate(&OzResponseFrame::ToolUse {
+        block_index: 0,
+        id: "tu_1".into(),
+        name: "ls".into(),
+        input: serde_json::json!({"path": "/tmp"}),
+    });
+    let paths: Vec<String> = events.iter().flat_map(extract_mask_paths).collect();
+    assert_eq!(paths, vec!["tool_call.server.payload".to_string()]);
+}
+
+#[test]
+fn fieldmask_append_actually_mutates_text_via_descriptor() {
+    // End-to-end: construct base + patch Message exactly as our adapter emits,
+    // run the same prost-reflect-based FieldMaskOperation pattern Warp uses,
+    // and confirm the resulting text is non-empty. If the path ever reverts
+    // to `message.X`, this test will fail.
+    use prost_reflect::{DynamicMessage, ReflectMessage, Value};
+    use prost_types::FieldMask;
+
+    let desc = wmaa::MESSAGE_DESCRIPTOR.clone();
+
+    let base = wmaa::Message {
+        id: "msg-1".into(),
+        task_id: "task-1".into(),
+        message: Some(wmaa::message::Message::AgentOutput(
+            wmaa::message::AgentOutput { text: String::new() },
+        )),
+        ..Default::default()
+    };
+    let patch = wmaa::Message {
+        id: "msg-1".into(),
+        task_id: "task-1".into(),
+        message: Some(wmaa::message::Message::AgentOutput(
+            wmaa::message::AgentOutput { text: "hello".into() },
+        )),
+        ..Default::default()
+    };
+    let mask = FieldMask {
+        paths: vec!["agent_output.text".into()],
+    };
+
+    let mut dyn_target = DynamicMessage::new(desc.clone());
+    dyn_target.transcode_from(&base).unwrap();
+    let mut dyn_patch = DynamicMessage::new(desc.clone());
+    dyn_patch.transcode_from(&patch).unwrap();
+
+    for path in &mask.paths {
+        let mut segs: Vec<&str> = path.split('.').collect();
+        apply(&mut dyn_target, &dyn_patch, &mut segs);
+    }
+
+    let merged: wmaa::Message = dyn_target.transcode_to().unwrap();
+    let text = match &merged.message {
+        Some(wmaa::message::Message::AgentOutput(a)) => a.text.clone(),
+        _ => panic!("agent_output variant missing after merge"),
+    };
+    assert_eq!(
+        text, "hello",
+        "FieldMask merge must yield non-empty text; if this is empty, the mask \
+         path is wrong (likely reverted to `message.agent_output.text`)."
+    );
+
+    fn apply(
+        target: &mut DynamicMessage,
+        patch: &DynamicMessage,
+        segs: &mut Vec<&str>,
+    ) {
+        let Some(first) = segs.first().copied() else {
+            return;
+        };
+        let Some(f) = target.descriptor().get_field_by_name(first) else {
+            panic!(
+                "segment {first:?} not found on descriptor {} — this means the \
+                 FieldMask is a no-op (the bug this test guards against)",
+                target.descriptor().full_name()
+            );
+        };
+        if segs.len() == 1 {
+            let pv = patch.get_field(&f).into_owned();
+            target.try_set_field(&f, pv).unwrap();
+            return;
+        }
+        let rest: Vec<&str> = segs[1..].to_vec();
+        let tv = target.get_field_mut(&f);
+        let pv = patch.get_field(&f);
+        match (&mut *tv, pv.as_ref()) {
+            (Value::Message(t), Value::Message(p)) => {
+                let mut rest_mut = rest;
+                apply(t, p, &mut rest_mut);
+            }
+            _ => panic!("non-message at segment {first:?}"),
+        }
+    }
+}
