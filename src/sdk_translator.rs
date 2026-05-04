@@ -12,6 +12,7 @@
 use anyhow::{anyhow, Result};
 use aws_sdk_bedrockruntime::types::{
     CachePointBlock, CachePointType, ContentBlock, ConversationRole, Message, SystemContentBlock,
+    ToolResultBlock, ToolResultContentBlock, ToolResultStatus, ToolUseBlock,
 };
 use aws_smithy_types::{Document, Number};
 use serde_json::Value;
@@ -142,8 +143,11 @@ fn parse_role(s: &str) -> Option<ConversationRole> {
 
 /// Map a single serde content block to an SDK [`ContentBlock`].
 ///
-/// Returns `Ok(None)` when the block is well-formed but not supported in
-/// Phase 0 (`tool_use`, `tool_result`, image, document, ...).
+/// Returns `Ok(None)` when the block is well-formed but not a variant we
+/// surface (image, document, `search_result`, audio, video, citations,
+/// guardrail, ...). Upstream callers log and skip the `None` case so a
+/// mixed-content array still produces a valid Message as long as at least
+/// one block translates.
 fn block_to_content(block: &Value) -> Result<Option<ContentBlock>> {
     if let Some(text) = extract_text_block(block) {
         return Ok(Some(ContentBlock::Text(text)));
@@ -155,7 +159,101 @@ fn block_to_content(block: &Value) -> Result<Option<ContentBlock>> {
             .map_err(|e| anyhow!("cache point build: {e}"))?;
         return Ok(Some(ContentBlock::CachePoint(cp)));
     }
+    if let Some(tu) = build_tool_use_block(block)? {
+        return Ok(Some(ContentBlock::ToolUse(tu)));
+    }
+    if let Some(tr) = build_tool_result_block(block)? {
+        return Ok(Some(ContentBlock::ToolResult(tr)));
+    }
     Ok(None)
+}
+
+/// Translate a Claude-shaped
+/// `{"type":"tool_use","id":...,"name":...,"input":{...}}`
+/// block into an SDK [`ToolUseBlock`]. Returns `Ok(None)` if the block is
+/// not a `tool_use`; returns `Err` if the block is `tool_use` but malformed
+/// (missing `id`/`name`).
+fn build_tool_use_block(block: &Value) -> Result<Option<ToolUseBlock>> {
+    if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+        return Ok(None);
+    }
+    let id = block
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("tool_use: missing 'id'"))?;
+    let name = block
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("tool_use: missing 'name'"))?;
+    // Missing `input` → empty object (tool schema with no parameters).
+    let input_doc = block
+        .get("input")
+        .map_or_else(|| Document::Object(std::collections::HashMap::new()), json_to_document);
+    let tu = ToolUseBlock::builder()
+        .tool_use_id(id)
+        .name(name)
+        .input(input_doc)
+        .build()
+        .map_err(|e| anyhow!("tool_use build: {e}"))?;
+    Ok(Some(tu))
+}
+
+/// Translate a Claude-shaped
+/// `{"type":"tool_result","tool_use_id":...,"content":[...],"is_error":bool}`
+/// block into an SDK [`ToolResultBlock`]. Each content entry becomes a
+/// [`ToolResultContentBlock`] — `text` → `Text`, `json` → `Json`, unknown
+/// entries are dropped with a warning. `is_error: true` → `Status::Error`,
+/// otherwise `Status::Success`.
+fn build_tool_result_block(block: &Value) -> Result<Option<ToolResultBlock>> {
+    if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+        return Ok(None);
+    }
+    let id = block
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("tool_result: missing 'tool_use_id'"))?;
+    let empty: Vec<Value> = Vec::new();
+    let content_arr = block
+        .get("content")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    let mut content: Vec<ToolResultContentBlock> = Vec::with_capacity(content_arr.len());
+    for (i, entry) in content_arr.iter().enumerate() {
+        match entry.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = entry.get("text").and_then(Value::as_str) {
+                    content.push(ToolResultContentBlock::Text(t.to_string()));
+                }
+            }
+            Some("json") => {
+                if let Some(j) = entry.get("json") {
+                    content.push(ToolResultContentBlock::Json(json_to_document(j)));
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    index = i,
+                    entry = %entry,
+                    "sdk_translator: dropping unsupported tool_result content entry"
+                );
+            }
+        }
+    }
+    let status = match block.get("is_error").and_then(Value::as_bool) {
+        Some(true) => Some(ToolResultStatus::Error),
+        _ => Some(ToolResultStatus::Success),
+    };
+    let mut tr_builder = ToolResultBlock::builder().tool_use_id(id);
+    for c in content {
+        tr_builder = tr_builder.content(c);
+    }
+    if let Some(s) = status {
+        tr_builder = tr_builder.status(s);
+    }
+    let tr = tr_builder
+        .build()
+        .map_err(|e| anyhow!("tool_result build: {e}"))?;
+    Ok(Some(tr))
 }
 
 fn extract_text_block(block: &Value) -> Option<String> {
