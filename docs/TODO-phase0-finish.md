@@ -1,59 +1,53 @@
-# Phase 0 Finish — the 4-step RealBedrock follow-up
+# Phase 0 Finish — the 4-step RealBedrock follow-up (CLOSED 2026-04-30)
 
-Task 17 landed as BLOCKED_PARTIAL: the skeleton smoke test + the `#[ignore]` gate
-are wired, but `RealBedrock::converse_stream` still panics `todo!()`. Finishing
-Phase 0 requires 4 concrete steps:
+All four steps landed before the 2026-04-30 real-Bedrock smoke test went
+green. Preserved as a historical record of what Phase 0 finish took.
 
-## Step 1 — Translate serde_json `messages` → `Vec<aws_sdk_bedrockruntime::types::Message>`
+## Step 1 — Translate serde_json `messages` → `Vec<aws_sdk_bedrockruntime::types::Message>` ✅
 
-In `src/bedrock_client.rs::RealBedrock::converse_stream`, take the
-`BedrockInput.messages: Vec<serde_json::Value>` and build typed SDK messages.
+Landed in `src/sdk_translator.rs::messages_to_sdk`.
 
-Each serde Value looks like:
-  {"role":"user","content":[{"type":"text","text":"..."},{"cachePoint":{...}}]}
+## Step 2 — Translate serde_json `system` → `Vec<SystemContentBlock>` ✅
 
-Translate to `aws_sdk_bedrockruntime::types::Message::builder()
-  .role(ConversationRole::User)
-  .content(ContentBlock::Text(...))
-  .content(ContentBlock::CachePoint(...))
-  .build()?`
+Landed in `src/sdk_translator.rs::system_to_sdk`.
 
-Block variants to support: text, tool_use (ContentBlock::ToolUse), tool_result,
-cache_point. Phase 0 can cover text + cache_point first; tool_use/result when
-the stub prompt walker in the translator gets extended.
+## Step 3 — Translate serde_json `tools` → `Option<ToolConfiguration>` ⏳ (Phase-A)
 
-## Step 2 — Translate serde_json `system` → `Vec<SystemContentBlock>`
+Deferred. `translator::extract_tool_defs` still returns `None`. Tool-use +
+tool-result loop is Phase-A scope.
 
-Same pattern for `BedrockInput.system`. Each entry is a `SystemContentBlock::Text`
-or `SystemContentBlock::CachePoint`.
+## Step 4 — `serde_json::Value` → `aws_smithy_types::Document` ✅
 
-## Step 3 — Translate serde_json `tools` → `Option<ToolConfiguration>`
+Landed in `src/sdk_translator.rs::json_to_document`.
 
-Build `ToolConfiguration::builder().tools(tool1).tools(tool2).build()?`. Each tool
-is a `Tool::ToolSpec(ToolSpecification::builder()...)`. Phase 0 can defer this
-(translator's `extract_tool_defs` returns None today).
+## Output-side translation ✅
 
-## Step 4 — `serde_json::Value` → `aws_smithy_types::Document` for `additional_model_request_fields`
+`translate_output_event` in `src/bedrock_client.rs` does the 6-way
+`ConverseStreamOutput` → `BedrockEvent` mapping.
 
-Walk the serde Value recursively, emitting `Document::Object`, `Document::Array`,
-`Document::String`, `Document::Number`, `Document::Bool`, `Document::Null`.
-Zero lossy surprises expected; a trivial 20-line conversion.
-
-## Output-side translation (1:1, confirmed)
-
-`ConverseStreamOutput` events map 1:1 to our `BedrockEvent` enum — already
-confirmed by the SDK shape check in Task 17. Drain via
-`output.stream.recv().await -> Result<Option<ConverseStreamOutput>, SdkError>`
-and dispatch on the 6 variants.
-
-## Verification
-
-After the impl lands:
+## Verification ✅
 
 ```bash
 AWS_BEARER_TOKEN_BEDROCK=<your-key> \
   cargo nextest run --test smoke_real_bedrock --run-ignored all
 ```
 
-Expected: PASS, with latency + token counts in tracing logs. Then update the
-README's status banner to remove "pre-alpha" and tag `v0.0.1`.
+Passed 2026-04-30. README promoted to v0.0.1 GA same day.
+
+---
+
+## Post-GA polish (2026-05-04)
+
+Three follow-up slices landed after the live-Warp UI audit surfaced bugs
+the Phase-0 smoke test had missed:
+
+1. **FieldMask path fix** (commit `b57c0f0`) — the `message.` prefix
+   caused every `AppendToMessageContent` to silently no-op in upstream
+   `field_mask::apply_path`. Guarded by 4 descriptor-walk tests.
+2. **Mid-stream error synthesized StreamFinished** (commit `80594ed`) —
+   closes the Phase-1 TODO in `route_multi_agent.rs`.
+3. **Input-variant walker extended** (commit `178d5a7`) — 4 additional
+   text-bearing variants beyond the original `UserInputs → UserQuery`.
+
+See `docs/upstream-warp-audit-2026-05.md` for the full audit against
+`warpdotdev/warp` and `zerx-lab/warp` HEAD.

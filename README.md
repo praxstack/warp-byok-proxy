@@ -2,8 +2,10 @@
 
 > **Status: v0.0.1 (GA).** End-to-end streaming against real AWS Bedrock is
 > working. Smoke-tested on 2026-04-30 with `anthropic.claude-opus-4-7`
-> (1M context beta + adaptive max thinking) on `us-east-1`. 77 Rust tests
-> green, one live-AWS smoke test (`#[ignore]`-gated, runs on demand).
+> (1M context beta + adaptive max thinking) on `us-east-1`. **85 Rust tests
+> green** (audited against `warpdotdev/warp` and `zerx-lab/warp` HEAD on
+> 2026-05-04 — see [`docs/upstream-warp-audit-2026-05.md`](docs/upstream-warp-audit-2026-05.md)),
+> one live-AWS smoke test (`#[ignore]`-gated, runs on demand).
 
 Local proxy that routes Warp Terminal's AI calls to your own AWS Bedrock
 account so you can pay-per-token for Claude Opus 4.7 instead of renting a
@@ -140,18 +142,20 @@ capturing for anyone reading the code:
 - `extract_system_prompt` and `extract_tool_defs` in `translator.rs`
   return `None` — the task_context walker for system prompts, RAG
   context, tool definitions, and prior tool results is Phase A scope.
-- Only one `Request.input` variant is walked today (`UserInputs →
-  UserQuery`). The 8 other variants (ResumeConversation, CodeReview,
-  InvokeSkill, SummarizeConversation, etc.) fall through to a diagnostic
-  stub. Warp client behavior audit in `docs/warp-client-behavior-audit-stub.md`.
-- Bedrock mid-stream errors produce a silent EOF on the client side
-  (no synthesized `StreamFinished` error frame). Flagged as a Phase-1
-  TODO in `src/route_multi_agent.rs`.
+- Five text-bearing `Request.input` variants are walked today
+  (`UserInputs → UserQuery` + `CliAgentUserQuery`; deprecated top-level
+  `UserQuery`; `AutoCodeDiffQuery`; `QueryWithCannedResponse`;
+  `CreateNewProject`). Metadata-only variants (`ResumeConversation`,
+  `InitProjectRules`, etc.) correctly no-op. Tool-result /
+  agent-message branches (`ToolCallResult`, `MessagesFromAgents`,
+  `CodeReview`, `InvokeSkill`, `SummarizeConversation`) are deferred to
+  the Phase-A task_context walker. Audit: `docs/warp-client-behavior-audit-stub.md`,
+  `docs/upstream-warp-audit-2026-05.md`.
 
 ## Running tests
 
 ```bash
-# Unit + integration (fast, offline, ~1s). 77 tests.
+# Unit + integration (fast, offline, ~1s). 85 tests.
 cargo nextest run
 
 # Real-AWS smoke (~5s, costs ~$0.001 per run, requires AWS creds).
