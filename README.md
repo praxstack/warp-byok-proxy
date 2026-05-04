@@ -2,10 +2,12 @@
 
 > **Status: v0.0.1 (GA).** End-to-end streaming against real AWS Bedrock is
 > working. Smoke-tested on 2026-04-30 with `anthropic.claude-opus-4-7`
-> (1M context beta + adaptive max thinking) on `us-east-1`. **85 Rust tests
+> (1M context beta + adaptive max thinking) on `us-east-1`. **91 Rust tests
 > green** (audited against `warpdotdev/warp` and `zerx-lab/warp` HEAD on
 > 2026-05-04 — see [`docs/upstream-warp-audit-2026-05.md`](docs/upstream-warp-audit-2026-05.md)),
-> one live-AWS smoke test (`#[ignore]`-gated, runs on demand).
+> one live-AWS smoke test (`#[ignore]`-gated, runs on demand). Tool-use +
+> tool-result round-trip through Claude shapes and the full
+> `task_context.tasks[*].messages[*]` history walker are live (2026-05-04).
 
 Local proxy that routes Warp Terminal's AI calls to your own AWS Bedrock
 account so you can pay-per-token for Claude Opus 4.7 instead of renting a
@@ -29,8 +31,9 @@ Warp's protobuf ResponseEvent shape so the Warp UI renders normally.
   ["context-1m-2025-08-07"]`.
 - **Out of Phase 0:** Every other `/ai/*` endpoint (suggestions,
   transcription, query prediction, codebase indexing, etc.) — return 404.
-  Tool-use + tool-result translation in RealBedrock is stubbed (text-only
-  turns work; tool dispatch comes in Phase A fork).
+  Variant-specific UI decoding for the 33 tool-call variants
+  (`RunShellCommand`, `ReadFiles`, etc.) in the UI adapter is still the
+  opaque `Server { payload }` fallback; richer variant rendering is Phase-A.
 
 ## Build
 
@@ -136,26 +139,33 @@ capturing for anyone reading the code:
 - The proxy is a disposable shim. It is NOT hardened for production — no
   auth on the loopback listener, no rate limiting, assumes a single local
   Warp client.
-- Tool-use + tool-result translation is stubbed. Text-only turns work end
-  to end; shell / file tools will `tracing::warn!` and skip. Phase A fork
-  lands the full tool loop.
-- `extract_system_prompt` and `extract_tool_defs` in `translator.rs`
-  return `None` — the task_context walker for system prompts, RAG
-  context, tool definitions, and prior tool results is Phase A scope.
-- Five text-bearing `Request.input` variants are walked today
-  (`UserInputs → UserQuery` + `CliAgentUserQuery`; deprecated top-level
-  `UserQuery`; `AutoCodeDiffQuery`; `QueryWithCannedResponse`;
-  `CreateNewProject`). Metadata-only variants (`ResumeConversation`,
-  `InitProjectRules`, etc.) correctly no-op. Tool-result /
-  agent-message branches (`ToolCallResult`, `MessagesFromAgents`,
-  `CodeReview`, `InvokeSkill`, `SummarizeConversation`) are deferred to
-  the Phase-A task_context walker. Audit: `docs/warp-client-behavior-audit-stub.md`,
+- Tool-use + tool-result translation is live. Assistant `tool_use` blocks
+  and user `tool_result` blocks round-trip through both the input walker
+  (translator.rs) and the SDK translator (sdk_translator.rs) to Bedrock's
+  typed `ContentBlock::ToolUse` / `ContentBlock::ToolResult`.
+  `ToolCallResult`'s 33 variant-specific result types are marshalled via
+  `prost-reflect`'s proto3 canonical JSON so all variants round-trip
+  without per-variant code.
+- `extract_system_prompt` and `extract_tool_defs` in `translator.rs` still
+  return `None` — tool-schema definitions and server-side system prompts
+  don't ride on the Warp request today (they live inside the Warp app
+  itself); adding a config-driven override is Phase-A scope.
+- Six text-bearing `Request.input` variants are walked today
+  (`UserInputs → UserQuery` / `CliAgentUserQuery` / `ToolCallResult`;
+  deprecated top-level `UserQuery`; `AutoCodeDiffQuery`;
+  `QueryWithCannedResponse`; `CreateNewProject`). The
+  `task_context.tasks[*].messages[*]` history walker covers the 5
+  conversation-relevant `api::Message` variants (`UserQuery`,
+  `AgentOutput`, `AgentReasoning`, `ToolCall`, `ToolCallResult`). UI-only
+  metadata variants (`ServerEvent`, `UpdateTodos`, `CodeReview`,
+  `InvokeSkill`, `Summarization`, `WebSearch`, ...) are correctly
+  filtered. Audit: `docs/warp-client-behavior-audit-stub.md`,
   `docs/upstream-warp-audit-2026-05.md`.
 
 ## Running tests
 
 ```bash
-# Unit + integration (fast, offline, ~1s). 85 tests.
+# Unit + integration (fast, offline, ~1s). 91 tests.
 cargo nextest run
 
 # Real-AWS smoke (~5s, costs ~$0.001 per run, requires AWS creds).
