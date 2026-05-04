@@ -186,9 +186,10 @@ fn build_tool_use_block(block: &Value) -> Result<Option<ToolUseBlock>> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("tool_use: missing 'name'"))?;
     // Missing `input` → empty object (tool schema with no parameters).
-    let input_doc = block
-        .get("input")
-        .map_or_else(|| Document::Object(std::collections::HashMap::new()), json_to_document);
+    let input_doc = block.get("input").map_or_else(
+        || Document::Object(std::collections::HashMap::new()),
+        json_to_document,
+    );
     let tu = ToolUseBlock::builder()
         .tool_use_id(id)
         .name(name)

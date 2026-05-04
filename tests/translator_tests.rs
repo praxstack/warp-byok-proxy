@@ -199,8 +199,7 @@ fn translates_user_inputs_tool_call_result_as_tool_result_block() {
 
     // Contract 1: a tool_result block with the matching tool_call_id is present.
     assert!(
-        serialized.contains("\"type\":\"tool_result\"")
-            || serialized.contains("\"tool_result\""),
+        serialized.contains("\"type\":\"tool_result\"") || serialized.contains("\"tool_result\""),
         "expected tool_result block in messages; got {serialized}"
     );
     assert!(
@@ -246,9 +245,7 @@ fn translates_prior_task_messages_into_assistant_history() {
     };
 
     let req = Request {
-        task_context: Some(TaskContext {
-            tasks: vec![task],
-        }),
+        task_context: Some(TaskContext { tasks: vec![task] }),
         input: Some(RequestInput {
             r#type: Some(req_input::Type::UserInputs(UserInputs {
                 inputs: vec![UserInput {

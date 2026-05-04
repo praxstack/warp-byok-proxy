@@ -7,9 +7,9 @@ use std::path::Path;
 use warp_multi_agent_api as wmaa;
 
 fn main() -> anyhow::Result<()> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        "/tmp/warp-multi-agent-request.bin".to_string()
-    });
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/warp-multi-agent-request.bin".to_string());
     let bytes = std::fs::read(Path::new(&path))?;
     println!("[info] read {} bytes from {}", bytes.len(), path);
     let req = wmaa::Request::decode(bytes.as_ref())?;

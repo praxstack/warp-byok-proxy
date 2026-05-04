@@ -349,7 +349,9 @@ fn fieldmask_append_actually_mutates_text_via_descriptor() {
         id: "msg-1".into(),
         task_id: "task-1".into(),
         message: Some(wmaa::message::Message::AgentOutput(
-            wmaa::message::AgentOutput { text: String::new() },
+            wmaa::message::AgentOutput {
+                text: String::new(),
+            },
         )),
         ..Default::default()
     };
@@ -357,7 +359,9 @@ fn fieldmask_append_actually_mutates_text_via_descriptor() {
         id: "msg-1".into(),
         task_id: "task-1".into(),
         message: Some(wmaa::message::Message::AgentOutput(
-            wmaa::message::AgentOutput { text: "hello".into() },
+            wmaa::message::AgentOutput {
+                text: "hello".into(),
+            },
         )),
         ..Default::default()
     };
@@ -386,11 +390,7 @@ fn fieldmask_append_actually_mutates_text_via_descriptor() {
          path is wrong (likely reverted to `message.agent_output.text`)."
     );
 
-    fn apply(
-        target: &mut DynamicMessage,
-        patch: &DynamicMessage,
-        segs: &mut Vec<&str>,
-    ) {
+    fn apply(target: &mut DynamicMessage, patch: &DynamicMessage, segs: &mut Vec<&str>) {
         let Some(first) = segs.first().copied() else {
             return;
         };

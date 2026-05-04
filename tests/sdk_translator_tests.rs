@@ -268,7 +268,10 @@ fn messages_to_sdk_tool_result_carries_json_content() {
                 let Document::Object(obj) = doc else {
                     panic!("json content should be Object, got {doc:?}");
                 };
-                assert!(matches!(obj.get("count"), Some(Document::Number(Number::PosInt(2)))));
+                assert!(matches!(
+                    obj.get("count"),
+                    Some(Document::Number(Number::PosInt(2)))
+                ));
             }
             other => panic!("expected Json, got {other:?}"),
         },

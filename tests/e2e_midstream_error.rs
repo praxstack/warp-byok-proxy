@@ -17,9 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 use warp_byok_proxy::{
-    bedrock_client::BedrockLike,
-    config::Config,
-    stream_accumulator::BedrockEvent,
+    bedrock_client::BedrockLike, config::Config, stream_accumulator::BedrockEvent,
     translator::BedrockInput,
 };
 use warp_multi_agent_api as wmaa;

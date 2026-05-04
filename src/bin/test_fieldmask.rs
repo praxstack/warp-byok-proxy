@@ -22,14 +22,26 @@ fn main() {
     }
     println!("--- oneofs ---");
     for o in desc.oneofs() {
-        println!("  oneof name={:?} fields=[{}]", o.name(),
-            o.fields().map(|f| f.name().to_string()).collect::<Vec<_>>().join(", "));
+        println!(
+            "  oneof name={:?} fields=[{}]",
+            o.name(),
+            o.fields()
+                .map(|f| f.name().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     println!();
 
     println!("--- get_field_by_name tests ---");
-    println!("  'message' -> {:?}", desc.get_field_by_name("message").is_some());
-    println!("  'agent_output' -> {:?}", desc.get_field_by_name("agent_output").is_some());
+    println!(
+        "  'message' -> {:?}",
+        desc.get_field_by_name("message").is_some()
+    );
+    println!(
+        "  'agent_output' -> {:?}",
+        desc.get_field_by_name("agent_output").is_some()
+    );
     println!("  'text' -> {:?}", desc.get_field_by_name("text").is_some());
 
     println!();
@@ -42,7 +54,9 @@ fn main() {
         id: "msg-1".to_string(),
         task_id: "task-1".to_string(),
         message: Some(wmaa::message::Message::AgentOutput(
-            wmaa::message::AgentOutput { text: "".to_string() },
+            wmaa::message::AgentOutput {
+                text: "".to_string(),
+            },
         )),
         ..Default::default()
     };
@@ -50,7 +64,9 @@ fn main() {
         id: "msg-1".to_string(),
         task_id: "task-1".to_string(),
         message: Some(wmaa::message::Message::AgentOutput(
-            wmaa::message::AgentOutput { text: "hello".to_string() },
+            wmaa::message::AgentOutput {
+                text: "hello".to_string(),
+            },
         )),
         ..Default::default()
     };
@@ -68,7 +84,12 @@ fn main() {
         dyn_patch.transcode_from(&patch).unwrap();
 
         for path in paths {
-            walk(&mut dyn_target, &dyn_patch, &path.split('.').collect::<Vec<_>>(), 0);
+            walk(
+                &mut dyn_target,
+                &dyn_patch,
+                &path.split('.').collect::<Vec<_>>(),
+                0,
+            );
         }
 
         let merged: wmaa::Message = dyn_target.transcode_to().unwrap();
@@ -80,7 +101,12 @@ fn main() {
     }
 }
 
-fn walk(target: &mut prost_reflect::DynamicMessage, patch: &prost_reflect::DynamicMessage, segs: &[&str], depth: usize) {
+fn walk(
+    target: &mut prost_reflect::DynamicMessage,
+    patch: &prost_reflect::DynamicMessage,
+    segs: &[&str],
+    depth: usize,
+) {
     let indent = "  ".repeat(depth);
     let Some(name) = segs.first() else {
         println!("{}(end)", indent);
@@ -88,7 +114,14 @@ fn walk(target: &mut prost_reflect::DynamicMessage, patch: &prost_reflect::Dynam
     };
     match target.descriptor().get_field_by_name(name) {
         Some(f) => {
-            println!("{}seg={:?} -> FOUND field #{} name={:?} kind={:?}", indent, name, f.number(), f.name(), f.kind());
+            println!(
+                "{}seg={:?} -> FOUND field #{} name={:?} kind={:?}",
+                indent,
+                name,
+                f.number(),
+                f.name(),
+                f.kind()
+            );
             if segs.len() == 1 {
                 let pv = patch.get_field(&f).into_owned();
                 println!("{}  setting target.{} = {:?}", indent, f.name(), pv);
@@ -100,12 +133,17 @@ fn walk(target: &mut prost_reflect::DynamicMessage, patch: &prost_reflect::Dynam
             let tv = target.get_field_mut(&f);
             let pv = patch.get_field(&f);
             match (&mut *tv, pv.as_ref()) {
-                (Value::Message(t), Value::Message(p)) => walk(t, p, &segs[1..], depth+1),
+                (Value::Message(t), Value::Message(p)) => walk(t, p, &segs[1..], depth + 1),
                 _ => println!("{}  (not a message; cannot recurse)", indent),
             }
         }
         None => {
-            println!("{}seg={:?} -> NOT FOUND in descriptor {} (NO-OP — this is the bug)", indent, name, target.descriptor().full_name());
+            println!(
+                "{}seg={:?} -> NOT FOUND in descriptor {} (NO-OP — this is the bug)",
+                indent,
+                name,
+                target.descriptor().full_name()
+            );
         }
     }
 }
