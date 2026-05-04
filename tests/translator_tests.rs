@@ -83,3 +83,106 @@ fn translates_user_query_text_into_bedrock_messages() {
         "placeholder leaked into translated output: {serialized}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Extended input-variant walker coverage (Slice 3 of the 2026-05 audit
+// follow-up). The Phase-0 walker only handled UserInputs→UserQuery, which
+// meant any client that sent one of the other 9 top-level Input variants
+// fell through to the "[PHASE0 WALKER: no UserQuery found]" diagnostic stub
+// and got a garbage turn. These tests lock in three additional variants that
+// are known to ship real prompt text.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(deprecated)]
+fn translates_deprecated_top_level_user_query() {
+    // Older Warp clients (and the ToolCallResult-heavy flows) use the deprecated
+    // top-level `Input::UserQuery` (field #2) instead of wrapping in UserInputs.
+    // The proto still defines it, prost still decodes it, and real captured
+    // traffic in docs/warp-client-behavior-audit-stub.md shows it in use on
+    // resume/continuation turns. Treat it as a first-class single-query input.
+    use warp_multi_agent_api::request::input::{self as req_input, UserQuery};
+    use warp_multi_agent_api::request::Input as RequestInput;
+    use warp_multi_agent_api::Request;
+
+    let req = Request {
+        input: Some(RequestInput {
+            r#type: Some(req_input::Type::UserQuery(UserQuery {
+                query: "legacy top-level query path".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let cfg = minimal_config();
+    let out = translate_warp_request(&req, &cfg).unwrap();
+    let serialized = serde_json::to_string(&out.messages).unwrap();
+    assert!(
+        serialized.contains("legacy top-level query path"),
+        "deprecated top-level UserQuery must be walked; got {serialized}"
+    );
+    assert!(
+        !serialized.contains("PHASE0 WALKER"),
+        "fallback stub leaked; top-level UserQuery not recognized: {serialized}"
+    );
+}
+
+#[test]
+fn translates_auto_code_diff_query() {
+    // `AutoCodeDiffQuery` fires when Warp detects compilation errors in the
+    // last run block and wants the agent to explain the diff. The proto
+    // carries the trigger text in `query`. We route it as a plain user turn.
+    use warp_multi_agent_api::request::input::{self as req_input, AutoCodeDiffQuery};
+    use warp_multi_agent_api::request::Input as RequestInput;
+    use warp_multi_agent_api::Request;
+
+    let req = Request {
+        input: Some(RequestInput {
+            r#type: Some(req_input::Type::AutoCodeDiffQuery(AutoCodeDiffQuery {
+                query: "auto diff explanation please".into(),
+            })),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let cfg = minimal_config();
+    let out = translate_warp_request(&req, &cfg).unwrap();
+    let serialized = serde_json::to_string(&out.messages).unwrap();
+    assert!(
+        serialized.contains("auto diff explanation please"),
+        "AutoCodeDiffQuery must be walked; got {serialized}"
+    );
+}
+
+#[test]
+fn translates_query_with_canned_response_query_field() {
+    // `QueryWithCannedResponse` carries a `query` string alongside the canned
+    // variant tag. Even when we do not honor the canned response branch,
+    // surfacing the user-typed `query` text keeps the BYOP proxy usable for
+    // zero-state chips ("Install", "Code", "Deploy", ...).
+    use warp_multi_agent_api::request::input::{self as req_input, QueryWithCannedResponse};
+    use warp_multi_agent_api::request::Input as RequestInput;
+    use warp_multi_agent_api::Request;
+
+    let req = Request {
+        input: Some(RequestInput {
+            r#type: Some(req_input::Type::QueryWithCannedResponse(
+                QueryWithCannedResponse {
+                    query: "help me install docker".into(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let cfg = minimal_config();
+    let out = translate_warp_request(&req, &cfg).unwrap();
+    let serialized = serde_json::to_string(&out.messages).unwrap();
+    assert!(
+        serialized.contains("help me install docker"),
+        "QueryWithCannedResponse.query must be walked; got {serialized}"
+    );
+}

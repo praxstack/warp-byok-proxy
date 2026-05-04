@@ -90,46 +90,91 @@ pub fn translate_warp_request(
     })
 }
 
+// The deprecated top-level `Input::UserQuery` variant (proto field #2) is
+// still emitted by older Warp clients on resume/continuation turns. The
+// `#[allow(deprecated)]` is load-bearing: dropping it would break real-world
+// compatibility and is explicitly out of scope for this slice.
+#[allow(deprecated)]
 fn extract_user_messages(req: &warp_multi_agent_api::Request) -> Vec<Value> {
-    // Phase 0 minimal-real walker:
-    //   req.input                  : Option<request::Input> (message wrapper)
-    //   request::Input.r#type      : Option<request::input::Type> (oneof)
-    //   request::input::Type::UserInputs(UserInputs)
-    //   UserInputs.inputs          : Vec<user_inputs::UserInput>
-    //   user_inputs::UserInput.input : Option<user_input::Input> (oneof)
-    //   user_input::Input::UserQuery(UserQuery)
-    //   UserQuery.query            : String
+    // Walker covers the Input variants known to ship user-typed prompt text.
+    // The `Request.input.type` oneof has ~11 variants; the ones below are the
+    // text-bearing branches. Empty/metadata-only variants (ResumeConversation,
+    // InitProjectRules, FetchReviewComments, StartFromAmbientRunPrompt) do
+    // not carry a query — they rely on task_context for the real work and
+    // are correctly handled by the empty-messages path today.
     //
-    // Everything else (ToolCallResult, ResumeConversation, CodeReview,
-    // InvokeSkill, SummarizeConversation, ...) is deferred to Phase 1's
-    // full task_context walker. We emit one user message per UserQuery
-    // found so Task 17's smoke test exercises a real prompt end-to-end.
+    // Covered variants (field numbers in the proto parentheses):
+    //   • UserInputs         (#6)  → each UserInput oneof:
+    //                                  - UserQuery.query
+    //                                  - CLIAgentUserQuery.user_query.query
+    //   • UserQuery          (#2, deprecated) — older clients / resume turns
+    //   • AutoCodeDiffQuery  (#5) — compile-error explanations
+    //   • QueryWithCannedResponse (#4) — zero-state chips w/ user-typed text
+    //   • CreateNewProject   (#10) — description rides in `query`
+    //
+    // Intentionally NOT walked here (deferred to the Phase-A task_context
+    // walker): ToolCallResult branches, SummarizeConversation, CodeReview,
+    // InvokeSkill — these feed structured context, not raw user prompts,
+    // and need variant-specific marshaling into Bedrock ContentBlocks.
     use warp_multi_agent_api::request::input::user_inputs::user_input as ui_oneof;
     use warp_multi_agent_api::request::input::Type as InputType;
 
     let mut messages = Vec::new();
 
+    let push_user_text = |messages: &mut Vec<Value>, text: &str| {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            messages.push(json!({
+                "role": "user",
+                "content": [{"type": "text", "text": text.to_string()}]
+            }));
+        }
+    };
+
     if let Some(input) = req.input.as_ref() {
-        if let Some(InputType::UserInputs(user_inputs)) = input.r#type.as_ref() {
-            for ui in &user_inputs.inputs {
-                if let Some(ui_oneof::Input::UserQuery(uq)) = ui.input.as_ref() {
-                    if !uq.query.trim().is_empty() {
-                        messages.push(json!({
-                            "role": "user",
-                            "content": [{"type": "text", "text": uq.query.clone()}]
-                        }));
+        match input.r#type.as_ref() {
+            Some(InputType::UserInputs(user_inputs)) => {
+                for ui in &user_inputs.inputs {
+                    match ui.input.as_ref() {
+                        Some(ui_oneof::Input::UserQuery(uq)) => {
+                            push_user_text(&mut messages, &uq.query);
+                        }
+                        Some(ui_oneof::Input::CliAgentUserQuery(cli)) => {
+                            if let Some(uq) = cli.user_query.as_ref() {
+                                push_user_text(&mut messages, &uq.query);
+                            }
+                        }
+                        // ToolCallResult / MessagesReceivedFromAgents / etc.
+                        // are Phase-A work — they need structured marshaling
+                        // rather than plain text injection.
+                        _ => {}
                     }
                 }
             }
+            Some(InputType::UserQuery(uq)) => {
+                // Deprecated top-level UserQuery (proto field #2). Still in
+                // use by older clients on resume/continuation turns.
+                push_user_text(&mut messages, &uq.query);
+            }
+            Some(InputType::AutoCodeDiffQuery(q)) => {
+                push_user_text(&mut messages, &q.query);
+            }
+            Some(InputType::QueryWithCannedResponse(q)) => {
+                push_user_text(&mut messages, &q.query);
+            }
+            Some(InputType::CreateNewProject(q)) => {
+                push_user_text(&mut messages, &q.query);
+            }
+            _ => {}
         }
     }
 
     // Fallback: if the walker found no queries (unsupported input variant or
-    // empty UserInputs), emit a diagnostic stub so Task 17 surfaces the gap
+    // empty UserInputs), emit a diagnostic stub so the turn surfaces the gap
     // clearly rather than silently sending nothing.
     if messages.is_empty() {
         tracing::warn!(
-            "translator: no UserQuery found in request.input; Phase 0 falls back to a diagnostic stub"
+            "translator: no text-bearing input variant matched; falling back to diagnostic stub"
         );
         messages.push(json!({
             "role": "user",
