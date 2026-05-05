@@ -83,12 +83,13 @@ impl Config {
     /// Validate the parsed config.
     ///
     /// # Errors
-    /// Returns an error if `enable_1m_context` is set on a model that is not
-    /// Claude Opus 4.6 or 4.7.
+    /// Returns an error if `enable_1m_context` is set on a model that does
+    /// not support the 1M-context beta. Currently: Claude Opus 4.6, Opus 4.7,
+    /// and Sonnet 4.7 per Anthropic's published support matrix (2026-Q1).
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.bedrock.enable_1m_context && !is_opus_4_6_or_4_7(&self.bedrock.model) {
+        if self.bedrock.enable_1m_context && !supports_1m_context(&self.bedrock.model) {
             anyhow::bail!(
-                "1M context requires Opus 4.6 or 4.7; current model: {}",
+                "1M context requires Opus 4.6, Opus 4.7, or Sonnet 4.7; current model: {}",
                 self.bedrock.model
             );
         }
@@ -118,11 +119,30 @@ impl Config {
     }
 }
 
-fn is_opus_4_6_or_4_7(model: &str) -> bool {
-    // Strip ':1m' suffix and any region/global prefix (handled elsewhere).
-    let m = model.rsplit_once(':').map_or(
-        model,
-        |(head, tail)| if tail == "1m" { head } else { model },
-    );
-    m.contains("claude-opus-4-6") || m.contains("claude-opus-4-7")
+/// Returns `true` if the model id belongs to a Claude family that supports
+/// the 1M-context beta (`anthropic_beta: ["context-1m-2025-08-07"]`).
+///
+/// Per Anthropic's support matrix as of 2026-Q1:
+///   * Opus 4.6 / 4.7 — supported
+///   * Sonnet 4.7 — supported (added 2025-12)
+///   * Sonnet 4.5 / Haiku / earlier Opus — NOT supported
+///
+/// Both the `:1m` suffix (our own marker) and the CRI/global prefix
+/// (`us.`, `eu.`, `apac.`, `jp.`, `au.`, `global.`) are stripped before
+/// matching so validation works uniformly on raw configs and wire-shaped
+/// ids.
+fn supports_1m_context(model: &str) -> bool {
+    // Strip trailing `:1m` marker.
+    let core = match model.rsplit_once(':') {
+        Some((head, "1m")) => head,
+        _ => model,
+    };
+    // Strip leading inference-profile prefix if present.
+    let stripped = ["us.", "eu.", "apac.", "jp.", "au.", "global."]
+        .iter()
+        .find_map(|p| core.strip_prefix(*p))
+        .unwrap_or(core);
+    stripped.contains("claude-opus-4-6")
+        || stripped.contains("claude-opus-4-7")
+        || stripped.contains("claude-sonnet-4-7")
 }

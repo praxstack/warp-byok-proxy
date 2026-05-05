@@ -61,7 +61,7 @@ fn rejects_unknown_effort() {
 }
 
 #[test]
-fn validate_1m_requires_opus_4_6_or_4_7() {
+fn validate_1m_requires_opus_4_6_or_4_7_or_sonnet_4_7() {
     let c = parse(
         r#"
         [bedrock]
@@ -73,8 +73,67 @@ fn validate_1m_requires_opus_4_6_or_4_7() {
     )
     .unwrap();
     let err = c.validate().unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("1m"));
+    // New policy: error message must enumerate ALL supported families so
+    // users aren't pointed at the wrong model. Opus 4.6/4.7 + Sonnet 4.7.
+    assert!(
+        msg.contains("opus") && msg.contains("sonnet"),
+        "expected opus+sonnet in error, got: {msg}"
+    );
+}
+
+#[test]
+fn validate_accepts_1m_for_sonnet_4_7() {
+    let c = parse(
+        r#"
+        [bedrock]
+        auth_mode = "api-key"
+        region = "us-east-1"
+        model = "anthropic.claude-sonnet-4-7:1m"
+        enable_1m_context = true
+    "#,
+    )
+    .unwrap();
+    c.validate()
+        .expect("Sonnet 4.7 with :1m must validate cleanly");
+}
+
+#[test]
+fn validate_accepts_1m_for_sonnet_4_7_with_cri_prefix() {
+    let c = parse(
+        r#"
+        [bedrock]
+        auth_mode = "api-key"
+        region = "us-east-1"
+        model = "us.anthropic.claude-sonnet-4-7:1m"
+        enable_1m_context = true
+    "#,
+    )
+    .unwrap();
+    // CRI-prefixed model ids must also validate — the gating helper must
+    // strip the prefix (us./eu./apac./global.) before matching families.
+    c.validate()
+        .expect("us.<sonnet-4-7>:1m must validate cleanly");
+}
+
+#[test]
+fn validate_rejects_1m_for_sonnet_4_5() {
+    // Sonnet 4.5 does NOT support 1M context — must fail even though the
+    // string prefix `sonnet-4` matches. This guards against a regex-like
+    // helper that matches too broadly.
+    let c = parse(
+        r#"
+        [bedrock]
+        auth_mode = "api-key"
+        region = "us-east-1"
+        model = "anthropic.claude-sonnet-4-5-v1:0"
+        enable_1m_context = true
+    "#,
+    )
+    .unwrap();
+    let err = c.validate().unwrap_err();
     assert!(err.to_string().to_lowercase().contains("1m"));
-    assert!(err.to_string().to_lowercase().contains("opus"));
 }
 
 // Plan had effort="max" which is the default; adjusted to "high" so the
