@@ -2,12 +2,16 @@
 
 > **Status: v0.0.1 (GA).** End-to-end streaming against real AWS Bedrock is
 > working. Smoke-tested on 2026-04-30 with `anthropic.claude-opus-4-7`
-> (1M context beta + adaptive max thinking) on `us-east-1`. **91 Rust tests
+> (1M context beta + adaptive max thinking) on `us-east-1`. **113 Rust tests
 > green** (audited against `warpdotdev/warp` and `zerx-lab/warp` HEAD on
 > 2026-05-04 — see [`docs/upstream-warp-audit-2026-05.md`](docs/upstream-warp-audit-2026-05.md)),
 > one live-AWS smoke test (`#[ignore]`-gated, runs on demand). Tool-use +
 > tool-result round-trip through Claude shapes and the full
 > `task_context.tasks[*].messages[*]` history walker are live (2026-05-04).
+> Phase 3 (2026-05-05) added per-kind message-id rotation in the UI adapter,
+> Sonnet 4.7 + CRI-prefixed `:1m` gating, config-driven `[[bedrock.tools]]`
+> schemas, and an opt-in `[proxy] stub_warp_api` layer for `/graphql` +
+> `/auth/*`.
 
 Local proxy that routes Warp Terminal's AI calls to your own AWS Bedrock
 account so you can pay-per-token for Claude Opus 4.7 instead of renting a
@@ -73,9 +77,10 @@ sudo -E warp-byok-proxy run
 auth_mode = "api-key"
 region    = "us-east-1"
 
-# Bedrock model ID. Append ":1m" to enable 1M context (Opus 4.6+ only).
-# CRI prefix (us./eu./apac./global.) is applied automatically based on
-# `use_cross_region_inference` and `use_global_inference` below.
+# Bedrock model ID. Append ":1m" to enable 1M context (Opus 4.6/4.7 and
+# Sonnet 4.7 as of 2026-Q1). CRI prefix (us./eu./apac./global.) is applied
+# automatically based on `use_cross_region_inference` and
+# `use_global_inference` below.
 model = "anthropic.claude-opus-4-7:1m"
 
 use_cross_region_inference = true
@@ -90,6 +95,23 @@ mode   = "adaptive"
 effort = "max"
 # For "enabled": token budget (default 16000).
 # budget_tokens = 32000
+
+# OPTIONAL — expose tools to Claude via Bedrock's ToolConfiguration.
+# Each entry needs a unique name, a description (the most important knob
+# for Claude's tool-selection quality), and the JSON Schema for the tool's
+# input object as a RAW JSON string. Schemas are parsed + validated at
+# startup, so a typo fails immediately instead of on the first request.
+# [[bedrock.tools]]
+# name = "get_weather"
+# description = "Look up current weather for a city."
+# input_schema_json = '{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}'
+
+# OPTIONAL — answer /graphql + /auth/* with inert 200 "ok" stubs so Warp's
+# startup probes don't hard-fail. Off by default to preserve the zero-egress
+# posture; only enable if you have run scripts/verify_zero_egress.sh and
+# understand that the stub does NOT synthesize login/session state.
+# [proxy]
+# stub_warp_api = true
 ```
 
 ## Verified working end-to-end
@@ -146,10 +168,13 @@ capturing for anyone reading the code:
   `ToolCallResult`'s 33 variant-specific result types are marshalled via
   `prost-reflect`'s proto3 canonical JSON so all variants round-trip
   without per-variant code.
-- `extract_system_prompt` and `extract_tool_defs` in `translator.rs` still
-  return `None` — tool-schema definitions and server-side system prompts
-  don't ride on the Warp request today (they live inside the Warp app
-  itself); adding a config-driven override is Phase-A scope.
+- `extract_system_prompt` in `translator.rs` still returns `None` — the
+  server-side system prompt lives inside the Warp app itself and doesn't
+  ride on the Warp request. `extract_tool_defs` also returns `None`, but
+  tool schemas are now sourced from config via `[[bedrock.tools]]`
+  (`sdk_translator::tools_to_sdk`) and attached to every Bedrock request,
+  so Claude can call BYO tools end-to-end. A config-driven system-prompt
+  override is still Phase-A scope.
 - Six text-bearing `Request.input` variants are walked today
   (`UserInputs → UserQuery` / `CliAgentUserQuery` / `ToolCallResult`;
   deprecated top-level `UserQuery`; `AutoCodeDiffQuery`;
@@ -165,7 +190,7 @@ capturing for anyone reading the code:
 ## Running tests
 
 ```bash
-# Unit + integration (fast, offline, ~1s). 91 tests.
+# Unit + integration (fast, offline, ~1s). 113 tests.
 cargo nextest run
 
 # Real-AWS smoke (~5s, costs ~$0.001 per run, requires AWS creds).
