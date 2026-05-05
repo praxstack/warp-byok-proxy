@@ -4,11 +4,14 @@
 //! credentials or network access.
 
 use aws_sdk_bedrockruntime::types::{
-    CachePointType, ContentBlock, ConversationRole, SystemContentBlock,
+    CachePointType, ContentBlock, ConversationRole, SystemContentBlock, Tool, ToolInputSchema,
 };
 use aws_smithy_types::{Document, Number};
 use serde_json::json;
-use warp_byok_proxy::sdk_translator::{json_to_document, messages_to_sdk, system_to_sdk};
+use warp_byok_proxy::config::ToolDef;
+use warp_byok_proxy::sdk_translator::{
+    json_to_document, messages_to_sdk, system_to_sdk, tools_to_sdk,
+};
 
 #[test]
 fn json_to_document_handles_primitives_and_null() {
@@ -305,4 +308,110 @@ fn system_to_sdk_returns_empty_for_none_or_non_array() {
     assert!(system_to_sdk(Some(&json!("not an array")))
         .unwrap()
         .is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// tools_to_sdk — Slice 3 of Phase 3. Bridges `Vec<config::ToolDef>` onto
+// Bedrock's typed `ToolConfiguration`. Empty input → `None` (Bedrock
+// rejects empty ToolConfiguration lists). Each entry's raw
+// `input_schema_json` string is parsed and forwarded as a smithy Document
+// inside `ToolInputSchema::Json`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tools_to_sdk_empty_list_returns_none() {
+    let out = tools_to_sdk(&[]).unwrap();
+    assert!(
+        out.is_none(),
+        "empty tool list must yield None, not an empty ToolConfiguration"
+    );
+}
+
+#[test]
+fn tools_to_sdk_single_tool_happy_path() {
+    let defs = vec![ToolDef {
+        name: "get_weather".into(),
+        description: "Look up current weather for a city.".into(),
+        input_schema_json:
+            r#"{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}"#
+                .into(),
+    }];
+    let cfg = tools_to_sdk(&defs).unwrap().expect("Some");
+    assert_eq!(cfg.tools().len(), 1);
+    match &cfg.tools()[0] {
+        Tool::ToolSpec(spec) => {
+            assert_eq!(spec.name(), "get_weather");
+            assert!(spec
+                .description()
+                .unwrap_or_default()
+                .contains("current weather"));
+            match spec.input_schema().expect("input_schema set") {
+                ToolInputSchema::Json(doc) => {
+                    let Document::Object(obj) = doc else {
+                        panic!("expected Document::Object, got {doc:?}");
+                    };
+                    assert!(
+                        matches!(obj.get("type"), Some(Document::String(s)) if s == "object"),
+                        "schema.type should round-trip as 'object'"
+                    );
+                    let Some(Document::Array(required)) = obj.get("required") else {
+                        panic!("expected 'required' array");
+                    };
+                    assert!(
+                        matches!(&required[0], Document::String(s) if s == "city"),
+                        "schema.required[0] should round-trip as 'city'"
+                    );
+                }
+                other => panic!("expected Json schema, got {other:?}"),
+            }
+        }
+        other => panic!("expected ToolSpec, got {other:?}"),
+    }
+}
+
+#[test]
+fn tools_to_sdk_multiple_tools_preserve_order() {
+    let defs = vec![
+        ToolDef {
+            name: "a_tool".into(),
+            description: "first".into(),
+            input_schema_json: r#"{"type":"object"}"#.into(),
+        },
+        ToolDef {
+            name: "b_tool".into(),
+            description: "second".into(),
+            input_schema_json: r#"{"type":"object"}"#.into(),
+        },
+        ToolDef {
+            name: "c_tool".into(),
+            description: "third".into(),
+            input_schema_json: r#"{"type":"object"}"#.into(),
+        },
+    ];
+    let cfg = tools_to_sdk(&defs).unwrap().unwrap();
+    assert_eq!(cfg.tools().len(), 3);
+    let names: Vec<&str> = cfg
+        .tools()
+        .iter()
+        .map(|t| match t {
+            Tool::ToolSpec(s) => s.name(),
+            _ => "UNKNOWN",
+        })
+        .collect();
+    assert_eq!(names, vec!["a_tool", "b_tool", "c_tool"]);
+}
+
+#[test]
+fn tools_to_sdk_propagates_parse_error_with_tool_name() {
+    let defs = vec![ToolDef {
+        name: "broken".into(),
+        description: "bad schema".into(),
+        input_schema_json: "{ this is not JSON".into(),
+    }];
+    let err = tools_to_sdk(&defs).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("broken"),
+        "error must name the bad tool; got: {msg}"
+    );
 }

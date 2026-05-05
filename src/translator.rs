@@ -85,6 +85,10 @@ pub fn translate_warp_request(
         messages: cache_result.messages,
         system: cache_result.system,
         additional_model_request_fields: Value::Object(amrf),
+        // Tool schemas live on the server side in the config (Warp doesn't
+        // ship them on the wire); `BedrockInput.tools` stays `None` here
+        // and `RealBedrock::converse_stream` loads them from `cfg.bedrock.tools`
+        // via `sdk_translator::tools_to_sdk` before dispatching.
         tools: extract_tool_defs(req),
     })
 }

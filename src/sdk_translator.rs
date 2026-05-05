@@ -12,10 +12,13 @@
 use anyhow::{anyhow, Result};
 use aws_sdk_bedrockruntime::types::{
     CachePointBlock, CachePointType, ContentBlock, ConversationRole, Message, SystemContentBlock,
-    ToolResultBlock, ToolResultContentBlock, ToolResultStatus, ToolUseBlock,
+    Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
+    ToolResultStatus, ToolSpecification, ToolUseBlock,
 };
 use aws_smithy_types::{Document, Number};
 use serde_json::Value;
+
+use crate::config::ToolDef;
 
 /// Recursively convert a `serde_json::Value` into an `aws_smithy_types::Document`.
 ///
@@ -270,4 +273,41 @@ fn extract_text_block(block: &Value) -> Option<String> {
 
 fn is_cache_point_block(block: &Value) -> bool {
     block.get("cachePoint").and_then(Value::as_object).is_some()
+}
+
+/// Translate our [`ToolDef`] config list into Bedrock's typed
+/// `ToolConfiguration`. Returns `Ok(None)` if `tools` is empty so the caller
+/// can pass an absent `tool_config` to the SDK (Bedrock rejects empty
+/// `ToolConfiguration` lists).
+///
+/// Each `ToolDef::input_schema_json` is parsed (it's a raw JSON string so
+/// users can paste a JSON Schema without fighting TOML's type system) and
+/// forwarded as a smithy `Document` inside [`ToolInputSchema::Json`].
+///
+/// # Errors
+/// Returns an error if a tool's `input_schema_json` fails to parse or if the
+/// SDK builder rejects the assembled `ToolSpecification` (missing required
+/// fields — but `name`/`description`/`input_schema` are all set here).
+pub fn tools_to_sdk(tools: &[ToolDef]) -> Result<Option<ToolConfiguration>> {
+    if tools.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(tools.len());
+    for t in tools {
+        let schema_json = t
+            .parse_input_schema()
+            .map_err(|e| anyhow!("tools_to_sdk: {e}"))?;
+        let spec = ToolSpecification::builder()
+            .name(&t.name)
+            .description(&t.description)
+            .input_schema(ToolInputSchema::Json(json_to_document(&schema_json)))
+            .build()
+            .map_err(|e| anyhow!("tool `{}`: build spec: {e}", t.name))?;
+        out.push(Tool::ToolSpec(spec));
+    }
+    let cfg = ToolConfiguration::builder()
+        .set_tools(Some(out))
+        .build()
+        .map_err(|e| anyhow!("tool configuration build: {e}"))?;
+    Ok(Some(cfg))
 }

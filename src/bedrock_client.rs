@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_bedrockruntime::types::{
     ContentBlockDelta, ContentBlockStart, ConverseStreamOutput, ReasoningContentBlockDelta,
+    ToolConfiguration,
 };
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use tokio_stream::wrappers::ReceiverStream;
@@ -149,6 +150,11 @@ impl BedrockLike for MockBedrock {
 pub struct RealBedrock {
     /// Underlying Bedrock SDK client, built by [`build_client`].
     pub client: BedrockClient,
+    /// Optional tool configuration, resolved at startup from
+    /// `cfg.bedrock.tools` via [`crate::sdk_translator::tools_to_sdk`].
+    /// Attached to every dispatched `ConverseStream` call when `Some` so
+    /// Claude can decide to emit `tool_use` blocks.
+    pub tool_config: Option<ToolConfiguration>,
 }
 
 #[async_trait::async_trait]
@@ -176,6 +182,9 @@ impl BedrockLike for RealBedrock {
             .additional_model_request_fields(amrf_doc);
         if !sdk_system.is_empty() {
             fluent = fluent.set_system(Some(sdk_system));
+        }
+        if let Some(tc) = self.tool_config.clone() {
+            fluent = fluent.tool_config(tc);
         }
 
         let output = fluent

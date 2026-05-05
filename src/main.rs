@@ -97,7 +97,21 @@ fn run_server(bind: &str) -> Result<()> {
             cfg.bedrock.endpoint.as_deref(),
         )
         .await?;
-        Ok::<_, anyhow::Error>(Arc::new(RealBedrock { client }) as Arc<dyn BedrockLike>)
+        // Resolve tool configuration once at startup — typos in
+        // cfg.bedrock.tools[].input_schema_json already failed config.validate()
+        // above, so a late parse failure here is unexpected but still propagated.
+        let tool_config = warp_byok_proxy::sdk_translator::tools_to_sdk(&cfg.bedrock.tools)
+            .context("translate cfg.bedrock.tools to ToolConfiguration")?;
+        if let Some(tc) = tool_config.as_ref() {
+            tracing::info!(
+                n_tools = tc.tools().len(),
+                "tool config loaded from cfg.bedrock.tools"
+            );
+        }
+        Ok::<_, anyhow::Error>(Arc::new(RealBedrock {
+            client,
+            tool_config,
+        }) as Arc<dyn BedrockLike>)
     })?;
 
     // 5. Spawn the server and wait for Ctrl-C.

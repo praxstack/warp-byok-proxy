@@ -25,6 +25,43 @@ pub struct Bedrock {
     pub enable_1m_context: bool,
     #[serde(default)]
     pub thinking: Thinking,
+    /// Optional list of tool definitions to expose to Claude via Bedrock's
+    /// `ToolConfiguration`. Defaults to empty (no tools). Each entry carries
+    /// a JSON Schema describing the tool's input shape — see [`ToolDef`].
+    #[serde(default)]
+    pub tools: Vec<ToolDef>,
+}
+
+/// One tool definition for Bedrock's `ToolConfiguration.tools[]`.
+///
+/// `input_schema_json` holds the JSON Schema as a raw TOML string so users
+/// can paste a schema without fighting TOML→JSON translation. The string is
+/// parsed + validated by [`ToolDef::parse_input_schema`] at startup so
+/// typos surface before the first request lands.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ToolDef {
+    /// Tool name that Claude will emit in `tool_use.name` when it decides to
+    /// call this tool. Warp maps arbitrary names into the generic
+    /// `Server { payload }` variant — see `ui_adapter::tool_use_event`.
+    pub name: String,
+    /// Human-readable description. Claude uses this to decide WHEN to call
+    /// the tool; it's the most important knob for tool-selection quality.
+    pub description: String,
+    /// JSON Schema for the tool's input object, as a raw string. Parsed +
+    /// validated by [`ToolDef::parse_input_schema`] at startup.
+    pub input_schema_json: String,
+}
+
+impl ToolDef {
+    /// Parse `input_schema_json` as a JSON value.
+    ///
+    /// # Errors
+    /// Returns an error if the string is not valid JSON.
+    pub fn parse_input_schema(&self) -> anyhow::Result<serde_json::Value> {
+        serde_json::from_str(&self.input_schema_json)
+            .map_err(|e| anyhow::anyhow!("tool `{}`: invalid input_schema_json: {e}", self.name))
+    }
 }
 
 fn yes() -> bool {
@@ -92,6 +129,11 @@ impl Config {
                 "1M context requires Opus 4.6, Opus 4.7, or Sonnet 4.7; current model: {}",
                 self.bedrock.model
             );
+        }
+        // Eagerly parse every tool's JSON Schema so typos fail at startup
+        // rather than on the first request dispatch.
+        for t in &self.bedrock.tools {
+            t.parse_input_schema()?;
         }
         Ok(())
     }

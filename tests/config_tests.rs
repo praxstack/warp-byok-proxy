@@ -136,6 +136,105 @@ fn validate_rejects_1m_for_sonnet_4_5() {
     assert!(err.to_string().to_lowercase().contains("1m"));
 }
 
+// ---------------------------------------------------------------------------
+// Tool definitions — Slice 3 of Phase 3. Config grows an optional
+// `[[bedrock.tools]]` array-of-tables; each entry is (name, description,
+// input_schema_json). Empty list is the default and preserves prior behavior.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parses_config_with_no_tools_section() {
+    // Backward compat: existing config.toml files have no `tools` section.
+    let c = parse(
+        r#"
+        [bedrock]
+        auth_mode = "api-key"
+        region = "us-east-1"
+        model = "anthropic.claude-opus-4-7:1m"
+    "#,
+    )
+    .unwrap();
+    assert!(c.bedrock.tools.is_empty(), "default must be empty vec");
+}
+
+#[test]
+fn parses_bedrock_tools_array_of_tables() {
+    let c = parse(
+        r##"
+        [bedrock]
+        auth_mode = "api-key"
+        region = "us-east-1"
+        model = "anthropic.claude-opus-4-7:1m"
+
+        [[bedrock.tools]]
+        name = "get_weather"
+        description = "Look up current weather for a city."
+        input_schema_json = '{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}'
+
+        [[bedrock.tools]]
+        name = "list_files"
+        description = "List files under a directory."
+        input_schema_json = '{"type":"object","properties":{"path":{"type":"string"}}}'
+    "##,
+    )
+    .unwrap();
+    assert_eq!(c.bedrock.tools.len(), 2);
+    assert_eq!(c.bedrock.tools[0].name, "get_weather");
+    assert_eq!(c.bedrock.tools[1].name, "list_files");
+    // Both schemas must parse cleanly.
+    let s0 = c.bedrock.tools[0].parse_input_schema().unwrap();
+    assert_eq!(s0["type"], "object");
+    assert_eq!(s0["required"][0], "city");
+}
+
+#[test]
+fn validate_rejects_tool_with_malformed_schema() {
+    let c = parse(
+        r##"
+        [bedrock]
+        auth_mode = "api-key"
+        region = "us-east-1"
+        model = "anthropic.claude-opus-4-7:1m"
+
+        [[bedrock.tools]]
+        name = "broken"
+        description = "Tool with invalid JSON schema"
+        input_schema_json = '{this is not valid json'
+    "##,
+    )
+    .unwrap();
+    let err = c.validate().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("broken") && msg.to_lowercase().contains("input_schema_json"),
+        "error must name the bad tool + field; got: {msg}"
+    );
+}
+
+#[test]
+fn tooldef_rejects_unknown_keys() {
+    // deny_unknown_fields guards against users mis-spelling `input_schema_json`
+    // as `schema` or `input_schema` and silently getting an empty schema.
+    let err = parse(
+        r##"
+        [bedrock]
+        auth_mode = "api-key"
+        region = "us-east-1"
+        model = "anthropic.claude-opus-4-7:1m"
+
+        [[bedrock.tools]]
+        name = "typo"
+        description = "desc"
+        schema = '{}'
+    "##,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("schema") || err.to_string().contains("unknown"),
+        "expected unknown-field error, got: {err}"
+    );
+}
+
 // Plan had effort="max" which is the default; adjusted to "high" so the
 // "ignored" warning fires per validate_with_warnings semantics.
 #[test]
