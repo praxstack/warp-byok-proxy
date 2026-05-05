@@ -212,6 +212,60 @@ fn validate_rejects_tool_with_malformed_schema() {
 }
 
 #[test]
+fn proxy_stub_warp_api_defaults_to_false() {
+    let c = parse(
+        r#"
+        [bedrock]
+        auth_mode = "api-key"
+        region = "us-east-1"
+        model = "anthropic.claude-opus-4-7:1m"
+    "#,
+    )
+    .unwrap();
+    assert!(
+        !c.proxy.stub_warp_api,
+        "zero-egress default must be preserved when [proxy] is absent"
+    );
+}
+
+#[test]
+fn proxy_stub_warp_api_parses_when_enabled() {
+    let c = parse(
+        r#"
+        [bedrock]
+        auth_mode = "api-key"
+        region = "us-east-1"
+        model = "anthropic.claude-opus-4-7:1m"
+
+        [proxy]
+        stub_warp_api = true
+    "#,
+    )
+    .unwrap();
+    assert!(c.proxy.stub_warp_api);
+}
+
+#[test]
+fn proxy_rejects_unknown_keys() {
+    let err = parse(
+        r#"
+        [bedrock]
+        auth_mode = "api-key"
+        region = "us-east-1"
+        model = "anthropic.claude-opus-4-7:1m"
+
+        [proxy]
+        stub_warp_apis = true
+    "#,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("stub_warp_apis") || err.to_string().contains("unknown"),
+        "expected unknown-field error, got: {err}"
+    );
+}
+
+#[test]
 fn tooldef_rejects_unknown_keys() {
     // deny_unknown_fields guards against users mis-spelling `input_schema_json`
     // as `schema` or `input_schema` and silently getting an empty schema.

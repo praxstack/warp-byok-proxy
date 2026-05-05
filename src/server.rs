@@ -216,7 +216,16 @@ async fn handle_with_context(
             let body = Full::new(Bytes::from("ok"));
             Ok(Response::new(full_to_boxed(body)))
         }
-        _ => {
+        (method, path) => {
+            // Feature-flagged Warp API stubs. When `proxy.stub_warp_api` is
+            // true, answer `/graphql` + `/auth/*` with inert 200 "ok" bodies
+            // so the Warp client's startup probes don't hard-fail. Off by
+            // default — the default return is 404 which preserves the
+            // zero-egress posture.
+            if cfg.proxy.stub_warp_api && is_warp_stub_path(path) {
+                tracing::debug!(%method, %path, "warp-stub: answering with inert 200");
+                return Ok(warp_stub_response());
+            }
             let body = Full::new(Bytes::new());
             let resp = Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -225,6 +234,26 @@ async fn handle_with_context(
             Ok(resp)
         }
     }
+}
+
+/// Returns `true` for request paths the stub answers with a 200 when
+/// `proxy.stub_warp_api` is enabled. Centralized in one function so the
+/// unit tests can pin the exact list.
+#[must_use]
+pub fn is_warp_stub_path(path: &str) -> bool {
+    path == "/graphql" || path.starts_with("/auth/")
+}
+
+/// Canned stub body returned for every warp-stub path. Deliberately minimal:
+/// a valid empty-envelope JSON shape that won't crash Warp's parser but
+/// doesn't fabricate login/session state either.
+fn warp_stub_response() -> Response<BoxedBody> {
+    let body = Full::new(Bytes::from(r#"{"data":null,"errors":[]}"#));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(full_to_boxed(body))
+        .expect("static warp-stub response")
 }
 
 // Task 14 legacy handler — retained solely for `spawn_test_server` and its

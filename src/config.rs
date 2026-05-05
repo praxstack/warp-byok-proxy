@@ -3,6 +3,24 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub bedrock: Bedrock,
+    #[serde(default)]
+    pub proxy: Proxy,
+}
+
+/// Proxy-level knobs distinct from the upstream Bedrock wiring.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Proxy {
+    /// When `true`, the proxy answers a small set of non-`/ai/multi-agent`
+    /// Warp endpoints (`/graphql`, `/auth/*`) with inert 200 stubs so the
+    /// Warp client's startup probes don't hard-fail and hide the real chat
+    /// plumbing. Off by default to preserve the zero-egress semantics the
+    /// proxy ships with — enable only if you have confirmed (via
+    /// `scripts/verify_zero_egress.sh`) that your `/etc/hosts` redirect is
+    /// in place for every Warp-contacted host and you can live with a 200
+    /// "ok" shape that does NOT include login/session state.
+    #[serde(default)]
+    pub stub_warp_api: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]

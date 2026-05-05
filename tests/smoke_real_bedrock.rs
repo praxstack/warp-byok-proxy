@@ -81,7 +81,10 @@ async fn opus_4_7_1m_max_thinking_streams_tokens() {
     )
     .await
     .expect("build bedrock client");
-    let real = RealBedrock { client, tool_config: None };
+    let real = RealBedrock {
+        client,
+        tool_config: None,
+    };
 
     // Build a minimal warp request with a real UserQuery.
     let req = build_user_query_request("Say hi in 5 words exactly.");
