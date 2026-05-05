@@ -334,6 +334,178 @@ fn tool_use_append_mask_has_no_message_prefix() {
     assert_eq!(paths, vec!["tool_call.server.payload".to_string()]);
 }
 
+// ---------------------------------------------------------------------------
+// Block-kind segmentation — Slice 1 of Phase 3.
+//
+// `Message.message` is a proto3 oneof, so a single Message proto can carry
+// EXACTLY ONE of {AgentOutput, AgentReasoning, ToolCall}. Reusing the same
+// `message_id` across a kind change means Warp's
+// `append_to_message_content` handler applies the FieldMask against a message
+// whose oneof is already locked to a different variant — the target field
+// doesn't exist on the current descriptor, so the apply silently no-ops and
+// the UI renders nothing for the second kind.
+//
+// Contract: whenever the block kind changes, the adapter MUST:
+//   1. Rotate `message_id` to a new uuid.
+//   2. Emit `AddMessagesToTask` with the new id and an empty instance of the
+//      target oneof variant, BEFORE the kind's first `AppendToMessageContent`.
+// ---------------------------------------------------------------------------
+
+fn collect_append_message_ids(events: &[wmaa::ResponseEvent]) -> Vec<String> {
+    events
+        .iter()
+        .flat_map(|e| match &e.r#type {
+            Some(wmaa::response_event::Type::ClientActions(ca)) => ca
+                .actions
+                .iter()
+                .filter_map(|a| match &a.action {
+                    Some(wmaa::client_action::Action::AppendToMessageContent(app)) => {
+                        app.message.as_ref().map(|m| m.id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+fn count_add_messages_actions(events: &[wmaa::ResponseEvent]) -> usize {
+    events
+        .iter()
+        .filter_map(|e| match &e.r#type {
+            Some(wmaa::response_event::Type::ClientActions(ca)) => Some(ca),
+            _ => None,
+        })
+        .flat_map(|ca| ca.actions.iter())
+        .filter(|a| {
+            matches!(
+                a.action,
+                Some(wmaa::client_action::Action::AddMessagesToTask(_))
+            )
+        })
+        .count()
+}
+
+#[test]
+fn kind_change_rotates_message_id_text_then_thinking() {
+    let mut a = UiAdapter::new(UiAdapterOpts::default());
+    let mut all = Vec::new();
+    all.extend(a.translate(&OzResponseFrame::TextDelta {
+        block_index: 0,
+        text: "hello".into(),
+    }));
+    all.extend(a.translate(&OzResponseFrame::ThinkingDelta {
+        block_index: 1,
+        text: "musing".into(),
+        signature: None,
+    }));
+    let ids = collect_append_message_ids(&all);
+    assert_eq!(ids.len(), 2, "expected one append per kind, got {ids:?}");
+    assert_ne!(
+        ids[0], ids[1],
+        "message_id MUST rotate on kind change (text→thinking); got same id: {ids:?}"
+    );
+}
+
+#[test]
+fn kind_change_rotates_message_id_thinking_then_text() {
+    let mut a = UiAdapter::new(UiAdapterOpts::default());
+    let mut all = Vec::new();
+    all.extend(a.translate(&OzResponseFrame::ThinkingDelta {
+        block_index: 0,
+        text: "pondering".into(),
+        signature: None,
+    }));
+    all.extend(a.translate(&OzResponseFrame::TextDelta {
+        block_index: 1,
+        text: "answer".into(),
+    }));
+    let ids = collect_append_message_ids(&all);
+    assert_eq!(ids.len(), 2);
+    assert_ne!(
+        ids[0], ids[1],
+        "message_id MUST rotate on kind change (thinking→text); got: {ids:?}"
+    );
+}
+
+#[test]
+fn kind_change_rotates_message_id_text_then_tool_use_then_text() {
+    let mut a = UiAdapter::new(UiAdapterOpts::default());
+    let mut all = Vec::new();
+    all.extend(a.translate(&OzResponseFrame::TextDelta {
+        block_index: 0,
+        text: "before".into(),
+    }));
+    all.extend(a.translate(&OzResponseFrame::ToolUse {
+        block_index: 1,
+        id: "tu-1".into(),
+        name: "ls".into(),
+        input: serde_json::json!({"path": "/"}),
+    }));
+    all.extend(a.translate(&OzResponseFrame::TextDelta {
+        block_index: 2,
+        text: "after".into(),
+    }));
+    let ids = collect_append_message_ids(&all);
+    assert_eq!(ids.len(), 3);
+    // All three must be distinct — including the text↔text pair separated by
+    // a tool_use, because the middle kind flip locked the prior text message.
+    assert_ne!(ids[0], ids[1], "text→tool_use must rotate");
+    assert_ne!(ids[1], ids[2], "tool_use→text must rotate");
+    assert_ne!(
+        ids[0], ids[2],
+        "text resuming after a tool_use must NOT reuse the pre-tool message id; got {ids:?}"
+    );
+}
+
+#[test]
+fn consecutive_same_kind_deltas_share_message_id() {
+    // Baseline: successive TextDeltas on the same turn SHOULD land on the
+    // same message_id — the oneof is already locked to AgentOutput, so the
+    // FieldMask patch is safe to keep appending.
+    let mut a = UiAdapter::new(UiAdapterOpts::default());
+    let mut all = Vec::new();
+    all.extend(a.translate(&OzResponseFrame::TextDelta {
+        block_index: 0,
+        text: "hel".into(),
+    }));
+    all.extend(a.translate(&OzResponseFrame::TextDelta {
+        block_index: 0,
+        text: "lo".into(),
+    }));
+    let ids = collect_append_message_ids(&all);
+    assert_eq!(ids.len(), 2, "one append per delta");
+    assert_eq!(
+        ids[0], ids[1],
+        "same-kind consecutive deltas must share message_id; got {ids:?}"
+    );
+}
+
+#[test]
+fn each_kind_change_emits_add_messages_to_task_prelude() {
+    let mut a = UiAdapter::new(UiAdapterOpts::default());
+    let mut all = Vec::new();
+    all.extend(a.translate(&OzResponseFrame::TextDelta {
+        block_index: 0,
+        text: "a".into(),
+    }));
+    all.extend(a.translate(&OzResponseFrame::ThinkingDelta {
+        block_index: 1,
+        text: "b".into(),
+        signature: None,
+    }));
+    all.extend(a.translate(&OzResponseFrame::TextDelta {
+        block_index: 2,
+        text: "c".into(),
+    }));
+    let n = count_add_messages_actions(&all);
+    assert_eq!(
+        n, 3,
+        "expected one AddMessagesToTask per distinct kind-run (text/thinking/text); got {n}"
+    );
+}
+
 #[test]
 fn fieldmask_append_actually_mutates_text_via_descriptor() {
     // End-to-end: construct base + patch Message exactly as our adapter emits,

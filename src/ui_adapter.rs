@@ -32,18 +32,44 @@ pub struct UiAdapterOpts {
     pub run_id: Option<String>,
 }
 
+/// Kind of content currently being streamed into the active message.
+///
+/// `Message.message` is a proto3 oneof, so a single `Message` proto carries
+/// EXACTLY ONE of `{AgentOutput, AgentReasoning, ToolCall}`. When the kind
+/// changes mid-turn (e.g. an `AgentReasoning` delta follows an `AgentOutput`
+/// delta), the adapter MUST rotate `message_id` and emit a fresh
+/// `AddMessagesToTask` — otherwise Warp's `FieldMask` merge targets a message
+/// whose oneof is already locked to the previous variant, which descriptor-
+/// walks into a no-op and renders as blank UI. See test
+/// `kind_change_rotates_message_id_text_then_thinking`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveKind {
+    AgentOutput,
+    AgentReasoning,
+    ToolCall,
+}
+
 /// Stateful translator from [`OzResponseFrame`] to
 /// [`wmaa::ResponseEvent`] batches.
 ///
 /// The adapter is single-turn: the first frame observed synthesizes the
-/// `StreamInit` and `CreateTask` prelude. All subsequent frames re-use the
-/// same task and message ids so the UI can stitch appended content into a
-/// single message.
+/// `StreamInit` and `CreateTask` prelude. Within a turn, each distinct
+/// kind-run (`text` / `reasoning` / `tool_call`) owns its own `message_id`,
+/// so the UI renders one logical message per kind.
 pub struct UiAdapter {
     opts: UiAdapterOpts,
     sent_init: bool,
     task_id: String,
+    /// The `id` of the message currently open for `AppendToMessageContent`.
+    /// Rotates every time `active_kind` flips. A fresh uuid is minted on
+    /// construction so the first delta has a stable target; that first uuid
+    /// is the one registered by the initial `AddMessagesToTask`.
     message_id: String,
+    /// Oneof variant the current `message_id` is locked to, if any. `None`
+    /// means no content has landed yet — the next `text`/`thinking`/`tool_use`
+    /// frame will set it AND emit the initial `AddMessagesToTask` as part of
+    /// the per-turn prelude.
+    active_kind: Option<ActiveKind>,
     /// Accumulated token usage. Populated by `UsageUpdate` frames
     /// (last-write-wins for Phase 0) and flushed onto `StreamFinished` when
     /// `Done` arrives.
@@ -59,6 +85,7 @@ impl UiAdapter {
             sent_init: false,
             task_id: format!("task-{}", Uuid::new_v4()),
             message_id: format!("msg-{}", Uuid::new_v4()),
+            active_kind: None,
             pending_usage: None,
         }
     }
@@ -94,24 +121,30 @@ impl UiAdapter {
                 | OzResponseFrame::Done { .. }
         );
         if !self.sent_init && needs_prelude {
-            // 3-part prelude — each must land BEFORE the first append. See
-            // doc on `translate` above and the real-world audit of Warp's
-            // consumer code for why all three are required.
+            // 2-part prelude — StreamInit + CreateTask. The third part
+            // (AddMessagesToTask) is emitted lazily by `ensure_kind_message`
+            // on the first content-bearing frame so its `oneof` variant
+            // matches the incoming frame's kind. Emitting an eager
+            // AgentOutput-flavored AddMessagesToTask here would cause the
+            // first AgentReasoning/ToolCall frame to hit a message whose
+            // oneof is locked to the wrong variant.
             events.push(self.stream_init_event());
             events.push(self.create_task_event());
-            events.push(self.add_messages_to_task_event());
             self.sent_init = true;
         }
         match frame {
             OzResponseFrame::TextDelta { text, .. } => {
+                events.extend(self.ensure_kind_message(ActiveKind::AgentOutput));
                 events.push(self.append_text_event(text));
             }
             OzResponseFrame::ThinkingDelta { text, .. } => {
+                events.extend(self.ensure_kind_message(ActiveKind::AgentReasoning));
                 events.push(self.append_thinking_event(text));
             }
             OzResponseFrame::ToolUse {
                 id, name, input, ..
             } => {
+                events.extend(self.ensure_kind_message(ActiveKind::ToolCall));
                 events.push(self.tool_use_event(id, name, input));
             }
             OzResponseFrame::ToolUseInputDelta { .. } | OzResponseFrame::BlockStop { .. } => {
@@ -141,6 +174,27 @@ impl UiAdapter {
         events
     }
 
+    /// Ensure there is a live `Message` proto on the task whose oneof variant
+    /// matches `kind`. If `active_kind` is `None` (first frame of the turn)
+    /// OR differs from `kind`, rotate `message_id` to a fresh uuid and emit
+    /// an `AddMessagesToTask` carrying an empty instance of the target
+    /// variant. Returns the synthesized events (zero or one).
+    ///
+    /// Must be called BEFORE the corresponding `append_*_event` so that
+    /// Warp's `append_to_message_content` handler finds a matching message
+    /// id whose oneof is already on the right branch.
+    fn ensure_kind_message(&mut self, kind: ActiveKind) -> Vec<wmaa::ResponseEvent> {
+        if self.active_kind == Some(kind) {
+            return Vec::new();
+        }
+        // Rotate message_id on EVERY kind change, including the very first
+        // (active_kind == None) frame — keeps the prelude message registered
+        // against the correct oneof variant from the start.
+        self.message_id = format!("msg-{}", Uuid::new_v4());
+        self.active_kind = Some(kind);
+        vec![self.add_messages_to_task_event_for(kind)]
+    }
+
     fn stream_init_event(&self) -> wmaa::ResponseEvent {
         wmaa::ResponseEvent {
             r#type: Some(wmaa::response_event::Type::Init(
@@ -166,21 +220,40 @@ impl UiAdapter {
         Self::client_actions_event(vec![action])
     }
 
-    /// Emits `AddMessagesToTask` carrying an empty `AgentOutput` message with
-    /// `id == self.message_id`. This is required BEFORE the first
-    /// `AppendToMessageContent` so that Warp's `append_to_message_content`
-    /// handler (in `task.rs:754-763`) can find a matching message by id.
-    /// Skipping this step is what causes Warp to silently drop appends and
-    /// render nothing — the bug caught live on 2026-04-30.
-    fn add_messages_to_task_event(&self) -> wmaa::ResponseEvent {
+    /// Emits `AddMessagesToTask` carrying an empty message whose oneof
+    /// variant matches `kind`. Required BEFORE the first
+    /// `AppendToMessageContent` for that kind so Warp's
+    /// `append_to_message_content` handler (in `task.rs:754-763`) can find
+    /// a matching message by id whose oneof is on the right branch.
+    /// Skipping this step — or landing an empty message of the wrong
+    /// variant first — is what causes Warp to silently drop appends and
+    /// render nothing.
+    fn add_messages_to_task_event_for(&self, kind: ActiveKind) -> wmaa::ResponseEvent {
+        let variant = match kind {
+            ActiveKind::AgentOutput => {
+                wmaa::message::Message::AgentOutput(wmaa::message::AgentOutput {
+                    text: String::new(),
+                })
+            }
+            ActiveKind::AgentReasoning => {
+                wmaa::message::Message::AgentReasoning(wmaa::message::AgentReasoning {
+                    reasoning: String::new(),
+                    finished_duration: None,
+                })
+            }
+            ActiveKind::ToolCall => wmaa::message::Message::ToolCall(wmaa::message::ToolCall {
+                tool_call_id: String::new(),
+                tool: Some(wmaa::message::tool_call::Tool::Server(
+                    wmaa::message::tool_call::Server {
+                        payload: String::new(),
+                    },
+                )),
+            }),
+        };
         let message = wmaa::Message {
             id: self.message_id.clone(),
             task_id: self.task_id.clone(),
-            message: Some(wmaa::message::Message::AgentOutput(
-                wmaa::message::AgentOutput {
-                    text: String::new(),
-                },
-            )),
+            message: Some(variant),
             ..Default::default()
         };
         let action = wmaa::ClientAction {
