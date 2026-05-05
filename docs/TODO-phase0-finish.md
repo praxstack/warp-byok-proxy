@@ -11,10 +11,18 @@ Landed in `src/sdk_translator.rs::messages_to_sdk`.
 
 Landed in `src/sdk_translator.rs::system_to_sdk`.
 
-## Step 3 — Translate serde_json `tools` → `Option<ToolConfiguration>` ⏳ (Phase-A)
+## Step 3 — Translate serde_json `tools` → `Option<ToolConfiguration>` ✅ (partial) / ⏳ (tool-schema defs)
 
-Deferred. `translator::extract_tool_defs` still returns `None`. Tool-use +
-tool-result loop is Phase-A scope.
+Tool-use + tool-result **block** translation landed 2026-05-04 (commits
+`a0ba7e2` + `a565f07`). Assistant `tool_use` and user `tool_result`
+round-trip through `sdk_translator::block_to_content` to Bedrock's typed
+`ContentBlock::ToolUse` / `ContentBlock::ToolResult`, and the input walker
+handles current-turn `ToolCallResult` plus `task_context` history.
+
+Still deferred: `translator::extract_tool_defs` returns `None` because
+Warp's `Request` protobuf doesn't carry tool schemas (tools live inside
+the Warp binary itself). A config-driven override (`[bedrock.tools]`
+section loading a JSONSchema file) is Phase-A scope.
 
 ## Step 4 — `serde_json::Value` → `aws_smithy_types::Document` ✅
 
